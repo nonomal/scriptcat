@@ -1,7 +1,8 @@
 import { AuthVerify } from "../auth";
 import type FileSystem from "../filesystem";
-import type { File, FileReader, FileWriter } from "../filesystem";
+import type { FileInfo, FileCreateOptions, FileReader, FileWriter } from "../filesystem";
 import { joinPath } from "../utils";
+import { createBaiduFileSystemError } from "./error";
 import { BaiduFileReader, BaiduFileWriter } from "./rw";
 
 export default class BaiduFileSystem implements FileSystem {
@@ -20,7 +21,7 @@ export default class BaiduFileSystem implements FileSystem {
     return this.list().then();
   }
 
-  async open(file: File): Promise<FileReader> {
+  async open(file: FileInfo): Promise<FileReader> {
     // 获取fsid
     return new BaiduFileReader(this, file);
   }
@@ -29,11 +30,11 @@ export default class BaiduFileSystem implements FileSystem {
     return new BaiduFileSystem(joinPath(this.path, path), this.accessToken);
   }
 
-  async create(path: string): Promise<FileWriter> {
+  async create(path: string, _opts?: FileCreateOptions): Promise<FileWriter> {
     return new BaiduFileWriter(this, joinPath(this.path, path));
   }
 
-  async createDir(dir: string): Promise<void> {
+  async createDir(dir: string, _opts?: FileCreateOptions): Promise<void> {
     dir = joinPath(this.path, dir);
     const urlencoded = new URLSearchParams();
     urlencoded.append("path", dir);
@@ -52,58 +53,44 @@ export default class BaiduFileSystem implements FileSystem {
       }
     );
     if (data.errno) {
-      throw new Error(JSON.stringify(data));
+      throw createBaiduFileSystemError(data);
     }
   }
 
   async request(url: string, config?: RequestInit) {
     config = config || {};
     const headers = <Headers>config.headers || new Headers();
-    // 处理请求匿名不发送cookie
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [100],
-      addRules: [
-        {
-          id: 100,
-          action: {
-            type: "modifyHeaders",
-            responseHeaders: [
-              {
-                operation: "remove",
-                header: "cookie",
-              },
-            ],
-          },
-          condition: {
-            urlFilter: url,
-            resourceTypes: ["xmlhttprequest"],
-          },
-        },
-      ],
-    });
     config.headers = headers;
+    // 对百度网盘请求显式禁用 cookie，避免依赖全局 DNR 规则造成并发竞态
+    config.credentials = "omit";
+    const parseResponse = async (response: Response) => {
+      if (!response.ok) {
+        // 失败响应可能没有 JSON body，容忍解析失败以保留 HTTP 状态分类
+        const data = await response.json().catch(() => ({
+          errmsg: response.statusText || `HTTP ${response.status}`,
+        }));
+        throw createBaiduFileSystemError({ ...data, httpStatus: response.status });
+      }
+      // 2xx 非 JSON（如代理返回的 HTML 页）必须报错，否则 list 会被判空导致全量覆盖云端
+      return response.json();
+    };
     return fetch(url, config)
-      .then((data) => data.json())
+      .then(parseResponse)
       .then(async (data) => {
         if (data.errno === 111 || data.errno === -6) {
           const token = await AuthVerify("baidu", true);
           this.accessToken = token;
           url = url.replace(/access_token=[^&]+/, `access_token=${token}`);
           return fetch(url, config)
-            .then((data2) => data2.json())
+            .then(parseResponse)
             .then((data2) => {
               if (data2.errno === 111 || data2.errno === -6) {
-                throw new Error(JSON.stringify(data2));
+                throw createBaiduFileSystemError(data2);
               }
               return data2;
             });
         }
         return data;
-      })
-      .finally(() => {
-        chrome.declarativeNetRequest.updateDynamicRules({
-          removeRuleIds: [100],
-        });
       });
   }
 
@@ -120,25 +107,44 @@ export default class BaiduFileSystem implements FileSystem {
       }
     ).then((data) => {
       if (data.errno) {
-        throw new Error(JSON.stringify(data));
+        throw createBaiduFileSystemError(data);
       }
       return data;
     });
   }
 
-  list(): Promise<File[]> {
-    return this.request(
-      `https://pan.baidu.com/rest/2.0/xpan/file?method=list&dir=${encodeURIComponent(
-        this.path
-      )}&order=time&access_token=${this.accessToken}`
-    ).then((data) => {
+  async list(): Promise<FileInfo[]> {
+    const list: FileInfo[] = [];
+    let start = 0;
+    const limit = 200;
+    // 防御性：限制最大分页轮询次数，避免在 API 异常返回时出现无限循环
+    const MAX_ITERATIONS = 100;
+    let iterations = 0;
+
+    while (true) {
+      if (iterations >= MAX_ITERATIONS) {
+        throw new Error(
+          "BaiduFileSystem.list: exceeded max pagination iterations, possible infinite loop from Baidu API response"
+        );
+      }
+      iterations += 1;
+      const data = await this.request(
+        `https://pan.baidu.com/rest/2.0/xpan/file?method=list&dir=${encodeURIComponent(
+          this.path
+        )}&order=time&start=${start}&limit=${limit}&access_token=${this.accessToken}`
+      );
+
       if (data.errno) {
         if (data.errno === -9) {
-          return [];
+          break;
         }
-        throw new Error(JSON.stringify(data));
+        throw createBaiduFileSystemError(data);
       }
-      const list: File[] = [];
+
+      if (!data.list || data.list.length === 0) {
+        break;
+      }
+
       data.list.forEach((val: any) => {
         list.push({
           fsid: val.fs_id,
@@ -150,8 +156,16 @@ export default class BaiduFileSystem implements FileSystem {
           updatetime: val.server_mtime * 1000,
         });
       });
-      return list;
-    });
+
+      // 如果返回的数据少于limit，说明已经是最后一页
+      if (data.list.length < limit) {
+        break;
+      }
+
+      start += limit;
+    }
+
+    return list;
   }
 
   async getDirUrl(): Promise<string> {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_scriptcat__",
-  "version": "1.2.0.1600",
+  "version": "1.5.0.1400",
   "author": "CodFrm",
   "description": "__MSG_scriptcat_description__",
   "options_ui": {
@@ -10,11 +10,10 @@
   },
   "background": {
     "service_worker": "src/service_worker.js",
-    "scripts": [
-      "src/service_worker.js"
-    ]
+    "scripts": ["src/service_worker.js"]
   },
   "incognito": "split",
+  "message_serialization": "structured_clone",
   "action": {
     "default_popup": "src/popup.html",
     "default_icon": {
@@ -34,7 +33,6 @@
     "scripting",
     "downloads",
     "activeTab",
-    "background",
     "webRequest",
     "userScripts",
     "contextMenus",
@@ -42,17 +40,18 @@
     "notifications",
     "clipboardWrite",
     "unlimitedStorage",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "debugger"
   ],
-  "optional_permissions": [
-    "userScripts"
-  ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
+  "optional_permissions": ["background", "userScripts"],
+  "host_permissions": ["<all_urls>"],
   "sandbox": {
-    "pages": [
-      "src/sandbox.html"
-    ]
-  }
+    "pages": ["src/sandbox.html"]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["/src/install.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

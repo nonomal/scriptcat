@@ -24,7 +24,7 @@ const URL_MATCH_CACHE_MAX_SIZE = 512; // 用来做简单缓存，512 算是足�
 
 // 检查 @match @include @exclude 是否按照MV3的 match pattern
 // export 只用于测试，不要在外部直接引用 checkUrlMatch
-export function checkUrlMatch(s: string) {
+export const checkUrlMatch = (s: string): string[] | null => {
   s = s.trim();
 
   const idx1 = s.indexOf("://");
@@ -54,12 +54,18 @@ export function checkUrlMatch(s: string) {
     }
   }
   return extMatch;
-}
+};
 
-const globSplit = (text: string) => {
-  text = text.replace(/\*{2,}/g, "*"); // api定义的 glob * 是等价于 glob **
-  text = text.replace(/\*(\?+)/g, "$1*"); // "*????" 改成 "????*"，避免 backward 处理
-  return text.split(/([*?])/g);
+const globSplit = (text: string): string[] => {
+  const split = text.split(/([*?]{2,})/g);
+  for (let i = 1; i < split.length; i += 2) {
+    // "*????" 改成 "????*"，避免 backward 处理
+    // api定义的 glob * 是等价于 glob **
+    const p = split[i]; // **??**??**
+    const q = p.replace(/\*/g, ""); // ????
+    if (p !== q) split[i] = `${q}*`; // ????*
+  }
+  return split.join("").split(/([*?])/g);
 };
 
 export const extractUrlPatterns = (lines: string[]): URLRuleEntry[] => {
@@ -81,6 +87,20 @@ export const extractUrlPatterns = (lines: string[]): URLRuleEntry[] => {
           content = "*://*/";
         } else {
           m = /^(\*|[-a-z]+|http\*):\/\/(\*?[^*/:]*)(:[^*/]*)?/.exec(content);
+          if (!m) {
+            // 如不是正确 match pattern, 为了兼容 TM，尝试 fallback 处理
+            // 例如 "// @match www.youtube.com/*"
+            let tu;
+            try {
+              tu = new URL(`undefined-protocol://${content}`); // e.g. "undefined-protocol://example.com/*"
+            } catch (_e) {
+              // 尝试失败则不忽略 （例如 "undefined-protocol://hello-world^^" ）
+            }
+            if (tu?.protocol === "undefined-protocol:" && tu.hostname && tu.pathname) {
+              content = `*://${tu.hostname}${tu.pathname}${tu.search}`;
+              m = /^(\*|[-a-z]+|http\*):\/\/(\*?[^*/:]*)(:[^*/]*)?/.exec(content);
+            }
+          }
           // 若无法匹对，则表示该表达式应为错误match pattern格式，忽略处理。
           if (m) {
             // 特殊处理：自动除去 port (TM的行为是以下完全等价)
@@ -210,6 +230,16 @@ export const extractUrlPatterns = (lines: string[]): URLRuleEntry[] => {
   return rules;
 };
 
+/**
+ * 取 @match pattern 归一化后的网域部分：具体网域返回该网域，`*.example.com` 返回 `.example.com`，
+ * `*` 返回空字串，不是 match pattern 则返回 null。
+ * 用于判断一条 @match 是否只服务于某个具体网域（== host 时才是）。
+ */
+export const getMatchPatternHost = (pattern: string): string | null => {
+  const [rule] = extractUrlPatterns([`@match ${pattern}`]);
+  return rule ? (rule.ruleContent as string[])[1] : null;
+};
+
 export const toUniquePatternStrings = (x: URLRuleEntry[]) => {
   return [...new Set<string>(x.map((e: URLRuleEntry) => e.patternString))];
 };
@@ -246,7 +276,7 @@ export const isUrlMatch = (url: string, rule: URLRuleEntry) => {
   return ret;
 };
 
-function isUrlMatchPattern(s: string, m: string[]) {
+const isUrlMatchPattern = (s: string, m: string[]): boolean => {
   let url;
   try {
     url = new URL(s);
@@ -289,9 +319,9 @@ function isUrlMatchPattern(s: string, m: string[]) {
   // 用于处理类似 "http://example.com/path?" 这样的 URL，
   // 确保在其余部分匹配时，这类 URL 也会被认为是匹配。
   return idx === path.length || (idx === path.length - 1 && path[idx] === "?");
-}
+};
 
-function isUrlMatchGlob(s: string, gs: string[]) {
+const isUrlMatchGlob = (s: string, gs: string[]): boolean => {
   let hashPos = s.indexOf("#");
   if (hashPos >= 0) {
     const hashPos2 = s.indexOf("#", hashPos + 1);
@@ -354,13 +384,13 @@ function isUrlMatchGlob(s: string, gs: string[]) {
   // 用于处理类似 "http://example.com/path?" 这样的 URL，
   // 确保在其余部分匹配时，这类 URL 也会被认为是匹配。
   return idx === path.length || (idx === path.length - 1 && path[idx] === "?");
-}
+};
 
-function isUrlMatchRegEx(s: string, ruleContent: [string, string]) {
+const isUrlMatchRegEx = (s: string, ruleContent: [string, string]): boolean => {
   return new RegExp(ruleContent[0], ruleContent[1] || "i").test(s);
-}
+};
 
-export const addMatchesToGlobs = (matches: URLRuleEntry[], globs: string[]) => {
+export const addMatchesToGlobs = (matches: URLRuleEntry[], globs: string[]): void => {
   for (const rule of matches) {
     if (rule.ruleType !== 1) continue;
     const [scheme0, host, path] = rule.ruleContent as string[];
@@ -375,7 +405,7 @@ export const addMatchesToGlobs = (matches: URLRuleEntry[], globs: string[]) => {
   }
 };
 
-export const extractMatchPatternsFromGlobs = (globs: string[]) => {
+export const extractMatchPatternsFromGlobs = (globs: string[]): (string | null)[] => {
   return globs.map((glob) => {
     if (glob.startsWith("http*://")) {
       glob = `*://${glob.substring(8)}`;
@@ -389,7 +419,7 @@ export const extractMatchPatternsFromGlobs = (globs: string[]) => {
   });
 };
 
-export const extractSchemesOfGlobs = (globs: string[]) => {
+export const extractSchemesOfGlobs = (globs: string[]): string[] => {
   const set = new Set(["*://*/*"]);
   for (const glob of globs) {
     const m = /^([-\w]+):\/\//.exec(glob);
@@ -497,4 +527,48 @@ export const getApiMatchesAndGlobs = (scriptUrlPatterns: URLRuleEntry[]) => {
     matches: apiMatches, // primary
     includeGlobs: apiIncludeGlobs, // includeGlobs applied after matches
   };
+};
+
+export type EmbeddedURLRuleEntry = Pick<URLRuleEntry, "ruleType" | "ruleContent">;
+
+export const embeddedPatternChecker = (
+  url: string,
+  scriptUrlPatterns: EmbeddedURLRuleEntry[],
+  isUrlMatchPattern: (s: string, m: string[]) => boolean,
+  isUrlMatchGlob: (s: string, gs: string[]) => boolean,
+  isUrlMatchRegEx: (s: string, ruleContent: [string, string]) => boolean
+): boolean => {
+  // 这个会直接转换成Function代码于网页环境执行。请不要在这里引入任何外部代码
+  let included = false;
+  let excluded = false;
+  for (const rule of scriptUrlPatterns) {
+    switch (rule.ruleType) {
+      case RuleType.MATCH_INCLUDE:
+        included ||= isUrlMatchPattern(url, rule.ruleContent as string[]);
+        break;
+      case RuleType.MATCH_EXCLUDE:
+        excluded ||= isUrlMatchPattern(url, rule.ruleContent as string[]);
+        if (excluded) return false;
+        break;
+      case RuleType.GLOB_INCLUDE:
+        included ||= isUrlMatchGlob(url, rule.ruleContent as string[]);
+        break;
+      case RuleType.GLOB_EXCLUDE:
+        excluded ||= isUrlMatchGlob(url, rule.ruleContent as string[]);
+        if (excluded) return false;
+        break;
+      case RuleType.REGEX_INCLUDE:
+        included ||= isUrlMatchRegEx(url, rule.ruleContent as [string, string]);
+        break;
+      case RuleType.REGEX_EXCLUDE:
+        excluded ||= isUrlMatchRegEx(url, rule.ruleContent as [string, string]);
+        if (excluded) return false;
+        break;
+    }
+  }
+  return included;
+};
+
+export const embeddedPatternCheckerString = (url: string, patternArray: string): string => {
+  return `(${embeddedPatternChecker})(${url},${patternArray},${isUrlMatchPattern},${isUrlMatchGlob},${isUrlMatchRegEx})`;
 };

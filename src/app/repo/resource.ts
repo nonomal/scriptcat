@@ -11,7 +11,7 @@ export interface Resource {
   hash: ResourceHash;
   type: ResourceType;
   link: { [key: string]: boolean }; // 关联的脚本
-  contentType: string;
+  contentType: string; // 下载成功的话必定有 contentType. 下载失败的话则没有 （空Resource）
   createtime: number;
   updatetime?: number;
 }
@@ -64,7 +64,7 @@ export class ResourceDAO extends Repo<Resource> {
 }
 
 // CompiledResource结构变更时，建议修改 CompiledResourceNamespace 以删除旧Cache
-export const CompiledResourceNamespace = "a51b9167-fdde-467a-a86f-75e5636adda2";
+export const CompiledResourceNamespace = "57d79c56-231a-42d3-b6e3-d2004ba0866f";
 
 export class CompiledResourceDAO extends Repo<CompiledResource> {
   constructor() {

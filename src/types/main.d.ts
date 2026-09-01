@@ -1,3 +1,6 @@
+/// <reference types="chrome" />
+/// <reference types="serviceworker" />
+
 declare module "@App/types/scriptcat.d.ts";
 declare module "*.tpl";
 declare module "*.json";
@@ -5,6 +8,9 @@ declare module "*.yaml";
 declare module "@App/app/types.d.ts";
 
 type Override<T, U> = Omit<T, keyof U> & U;
+type RequireField<T, K extends keyof T> = T & Required<Pick<T, K>>;
+type ValueOf<T> = T[keyof T];
+type ReactStateSetter<T> = (value: T | ((prev: T) => T)) => void;
 
 declare const sandbox: Window;
 
@@ -27,10 +33,23 @@ interface FileSystemObserverInstance {
   observe(handle: FileSystemFileHandle | FileSystemDirectoryHandle | FileSystemSyncAccessHandle): Promise<void>;
 }
 
-declare const MessageFlag: string;
+// File System Access API：标准 DOM lib 未声明，仅 Chromium 提供，运行时以特性检测兜底
+interface DataTransferItem {
+  getAsFileSystemHandle(): Promise<FileSystemHandle | null>;
+}
+
+interface Window {
+  showOpenFilePicker(options?: {
+    multiple?: boolean;
+    excludeAcceptAllOption?: boolean;
+    types?: { description?: string; accept: Record<string, string[]> }[];
+  }): Promise<FileSystemFileHandle[]>;
+}
+
+declare const UserAgentData: typeof GM_info.userAgentData | undefined;
 
 // 可以让content与inject环境交换携带dom的对象
-declare let cloneInto: ((detail: any, view: any) => any) | undefined;
+declare let cloneInto: ((obj: object, targetScope: object, options?: object) => object) | undefined;
 
 declare namespace GMSend {
   interface XHRDetails {

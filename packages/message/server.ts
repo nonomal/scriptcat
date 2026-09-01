@@ -87,6 +87,15 @@ export class SenderRuntime {
 
   getExtMessageSender(): ExtMessageSender {
     const sender = this.sender as RuntimeMessageSender;
+    if (!sender) {
+      // postMessage 通道（如 Offscreen→SW）没有 RuntimeMessageSender
+      return {
+        windowId: -1,
+        tabId: -1,
+        frameId: undefined,
+        documentId: undefined,
+      };
+    }
     return {
       windowId: sender.tab?.windowId || -1, // -1表示后台脚本
       tabId: sender.tab?.id || -1, // -1表示后台脚本
@@ -100,9 +109,22 @@ export class SenderRuntime {
   }
 }
 
-type ApiFunction = (params: any, con: IGetSender) => Promise<any> | void;
+type ApiFunction = (params: any, con: IGetSender) => Promise<any> | any | void;
 type ApiFunctionSync = (params: any, con: IGetSender) => any;
 type MiddlewareFunction = (params: any, con: IGetSender, next: () => Promise<any> | any) => Promise<any> | any;
+
+const formatErrorToClient = (e: any) => {
+  if (!e) return `${e}`;
+  if (typeof e?.message === "string") return e.message;
+  if (typeof e === "object") {
+    try {
+      return JSON.stringify(e);
+    } catch {
+      // ignored
+    }
+  }
+  return e.toString();
+};
 
 export class Server {
   private apiFunctionMap: Map<string, ApiFunction> = new Map();
@@ -159,7 +181,7 @@ export class Server {
               data && con.sendMessage({ code: 0, data });
             })
             .catch((e: Error) => {
-              con.sendMessage({ code: -1, message: e.message || e.toString() });
+              con.sendMessage({ code: -1, message: formatErrorToClient(e) });
               this.logger.error("connectHandle error", Logger.E(e));
             });
           return true;
@@ -191,7 +213,7 @@ export class Server {
               }
             })
             .catch((e: Error) => {
-              sendResponse({ code: -1, message: e.message || e.toString() });
+              sendResponse({ code: -1, message: formatErrorToClient(e) });
               this.logger.error("messageHandle error", Logger.E(e));
             });
           return true;
@@ -199,7 +221,7 @@ export class Server {
           sendResponse({ code: 0, data: ret });
         }
       } catch (e: any) {
-        sendResponse({ code: -1, message: e.message || e.toString() });
+        sendResponse({ code: -1, message: formatErrorToClient(e) });
         this.logger.error("messageHandle error", Logger.E(e));
       }
     } else {
@@ -273,23 +295,15 @@ export function forwardMessage(
   senderTo: MessageSend,
   middleware?: ApiFunctionSync
 ) {
-  const handler = (params: any, fromCon: IGetSender) => {
-    const fromConnect = fromCon.getConnect();
+  const handler = async (params: any, fromCon: IGetSender): Promise<any> => {
+    const fromConnect: MessageConnect | undefined = fromCon.getConnect();
     if (fromConnect) {
-      connect(senderTo, `${prefix}/${path}`, params).then((toCon: MessageConnect) => {
-        fromConnect.onMessage((data) => {
-          toCon.sendMessage(data);
-        });
-        toCon.onMessage((data) => {
-          fromConnect.sendMessage(data);
-        });
-        fromConnect.onDisconnect(() => {
-          toCon.disconnect();
-        });
-        toCon.onDisconnect(() => {
-          fromConnect.disconnect();
-        });
-      });
+      const toCon: MessageConnect = await connect(senderTo, `${prefix}/${path}`, params);
+      fromConnect.onMessage(toCon.sendMessage.bind(toCon));
+      toCon.onMessage(fromConnect.sendMessage.bind(fromConnect));
+      fromConnect.onDisconnect(toCon.disconnect.bind(toCon));
+      toCon.onDisconnect(fromConnect.disconnect.bind(fromConnect));
+      return undefined;
     } else {
       return sendMessage(senderTo, prefix + "/" + path, params);
     }

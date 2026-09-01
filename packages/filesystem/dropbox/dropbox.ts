@@ -1,8 +1,76 @@
 import { AuthVerify } from "../auth";
+import { FileSystemError, isConflictError, isNotFoundError } from "../error";
 import type FileSystem from "../filesystem";
-import type { File, FileReader, FileWriter } from "../filesystem";
+import type { FileInfo, FileCreateOptions, FileReader, FileWriter } from "../filesystem";
 import { joinPath } from "../utils";
 import { DropboxFileReader, DropboxFileWriter } from "./rw";
+
+type DropboxErrorBody = {
+  error_summary?: string;
+  error?: {
+    ".tag"?: string;
+    path_lookup?: {
+      ".tag"?: string;
+    };
+    path?: {
+      ".tag"?: string;
+    };
+  };
+};
+
+function parseDropboxError(raw: unknown): { summary?: string; raw: unknown } {
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { summary: raw, raw };
+    }
+  }
+
+  if (parsed && typeof parsed === "object") {
+    const body = parsed as DropboxErrorBody;
+    if (typeof body.error_summary === "string") {
+      return { summary: body.error_summary, raw: parsed };
+    }
+    if (typeof body.error?.path_lookup?.[".tag"] === "string") {
+      return { summary: `path_lookup/${body.error.path_lookup[".tag"]}`, raw: parsed };
+    }
+    if (typeof body.error?.path?.[".tag"] === "string") {
+      return { summary: `path/${body.error.path[".tag"]}`, raw: parsed };
+    }
+    if (typeof body.error?.[".tag"] === "string") {
+      return { summary: body.error[".tag"], raw: parsed };
+    }
+  }
+
+  return { raw: parsed };
+}
+
+function toDropboxFileSystemError(status: number, raw: unknown): FileSystemError {
+  const { summary, raw: parsed } = parseDropboxError(raw);
+  const code = summary;
+  const notFound = summary?.includes("path_lookup/not_found") === true || summary?.includes("path/not_found") === true;
+  // Dropbox 用 HTTP 409 承载所有结构化错误（无写权限/空间不足等），只有明确 conflict 语义才算冲突
+  const conflict =
+    !notFound && (summary?.includes("path/conflict") === true || summary?.includes("path_write/conflict") === true);
+  const rateLimit = status === 429;
+  // 只重试瞬时 5xx；501 等属于永久失败，重试只会空转退避
+  const transient = [500, 502, 503, 504].includes(status);
+  const auth = status === 401 || summary?.includes("invalid_access_token") === true;
+  return new FileSystemError({
+    provider: "dropbox",
+    message: `Dropbox API Error${status ? `: ${status}` : ""}${summary ? ` - ${summary}` : ""}`,
+    status,
+    code,
+    notFound,
+    conflict,
+    rateLimit,
+    auth,
+    retryable: rateLimit || transient,
+    raw: parsed,
+  });
+}
 
 export default class DropboxFileSystem implements FileSystem {
   accessToken?: string;
@@ -24,7 +92,7 @@ export default class DropboxFileSystem implements FileSystem {
     return this.list().then();
   }
 
-  open(file: File): Promise<FileReader> {
+  open(file: FileInfo): Promise<FileReader> {
     return Promise.resolve(new DropboxFileReader(this, file));
   }
 
@@ -32,11 +100,11 @@ export default class DropboxFileSystem implements FileSystem {
     return Promise.resolve(new DropboxFileSystem(joinPath(this.path, path), this.accessToken));
   }
 
-  create(path: string): Promise<FileWriter> {
+  create(path: string, _opts?: FileCreateOptions): Promise<FileWriter> {
     return Promise.resolve(new DropboxFileWriter(this, joinPath(this.path, path)));
   }
 
-  async createDir(dir: string): Promise<void> {
+  async createDir(dir: string, _opts?: FileCreateOptions): Promise<void> {
     if (!dir) {
       return Promise.resolve();
     }
@@ -64,7 +132,7 @@ export default class DropboxFileSystem implements FileSystem {
       this.pathCache.add(fullPath);
     } catch (error: any) {
       // 如果目录已存在，Dropbox 会返回错误，但这是正常情况
-      if (error.message && error.message.includes("path/conflict")) {
+      if (isConflictError(error)) {
         // 目录已存在，不需要报错
         this.pathCache.add(fullPath);
         return;
@@ -78,17 +146,31 @@ export default class DropboxFileSystem implements FileSystem {
   request(url: string, config?: RequestInit, nothen?: boolean) {
     config = config || {};
     const headers = <Headers>config.headers || new Headers();
-    headers.append(`Authorization`, `Bearer ${this.accessToken}`);
+    headers.set(`Authorization`, `Bearer ${this.accessToken}`);
     config.headers = headers;
-    const ret = fetch(url, config);
+    const doFetch = () => fetch(url, config);
+    const retryWithFreshToken = async () => {
+      const token = await AuthVerify("dropbox", true);
+      this.accessToken = token;
+      headers.set(`Authorization`, `Bearer ${this.accessToken}`);
+      return doFetch();
+    };
     if (nothen) {
-      return <Promise<Response>>ret;
+      return doFetch().then(async (resp) => {
+        if (resp.status === 401) {
+          return retryWithFreshToken();
+        }
+        return resp;
+      });
     }
-    return ret
+    return doFetch()
       .then(async (response) => {
+        if (response.status === 401) {
+          response = await retryWithFreshToken();
+        }
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`Dropbox API Error: ${response.status} - ${errorText}`);
+          throw toDropboxFileSystemError(response.status, errorText);
         }
         return response.json();
       })
@@ -103,21 +185,25 @@ export default class DropboxFileSystem implements FileSystem {
               .then(async (retryResponse) => {
                 if (!retryResponse.ok) {
                   const errorText = await retryResponse.text();
-                  throw new Error(`Dropbox API Error: ${retryResponse.status} - ${errorText}`);
+                  throw toDropboxFileSystemError(retryResponse.status, errorText);
                 }
                 return retryResponse.json();
               })
               .then((retryData) => {
                 if (retryData.error) {
-                  throw new Error(JSON.stringify(retryData));
+                  throw toDropboxFileSystemError(200, retryData);
                 }
                 return retryData;
               });
           }
-          throw new Error(JSON.stringify(data));
+          throw toDropboxFileSystemError(200, data);
         }
         return data;
       });
+  }
+
+  async createResponseError(resp: Response): Promise<FileSystemError> {
+    return toDropboxFileSystemError(resp.status, await resp.text());
   }
 
   async delete(path: string): Promise<void> {
@@ -126,19 +212,26 @@ export default class DropboxFileSystem implements FileSystem {
     const myHeaders = new Headers();
     myHeaders.append("Content-Type", "application/json");
 
-    await this.request("https://api.dropboxapi.com/2/files/delete_v2", {
-      method: "POST",
-      headers: myHeaders,
-      body: JSON.stringify({
-        path: fullPath,
-      }),
-    });
+    try {
+      await this.request("https://api.dropboxapi.com/2/files/delete_v2", {
+        method: "POST",
+        headers: myHeaders,
+        body: JSON.stringify({
+          path: fullPath,
+        }),
+      });
+    } catch (e: any) {
+      if (isNotFoundError(e)) {
+        return;
+      }
+      throw e;
+    }
 
     // 清除相关缓存
     this.clearRelatedCache(fullPath);
   }
 
-  async list(): Promise<File[]> {
+  async list(): Promise<FileInfo[]> {
     let folderPath = this.path;
 
     // Dropbox API 需要空字符串来表示根目录
@@ -149,34 +242,58 @@ export default class DropboxFileSystem implements FileSystem {
     const myHeaders = new Headers();
     myHeaders.append("Content-Type", "application/json");
 
-    const response = await this.request("https://api.dropboxapi.com/2/files/list_folder", {
+    let response = await this.request("https://api.dropboxapi.com/2/files/list_folder", {
       method: "POST",
       headers: myHeaders,
       body: JSON.stringify({
         path: folderPath,
       }),
     }).catch((e) => {
-      if (e.message.includes("path/not_found")) {
-        return { entries: [] }; // 返回空数组以避免后续错误
+      if (isNotFoundError(e)) {
+        return { entries: [], has_more: false }; // 返回空数组以避免后续错误
       }
       throw e;
     });
 
-    const list: File[] = [];
-    if (response.entries) {
-      for (const item of response.entries) {
-        // 只包含文件，跳过文件夹
-        if (item[".tag"] === "file") {
-          list.push({
-            name: item.name,
-            path: this.path,
-            size: item.size || 0,
-            digest: item.content_hash || "",
-            createtime: new Date(item.client_modified).getTime(),
-            updatetime: new Date(item.server_modified).getTime(),
-          });
+    const list: FileInfo[] = [];
+
+    const MAX_ITERATIONS = 100;
+    let iterationCount = 0;
+
+    while (true) {
+      iterationCount++;
+      if (iterationCount > MAX_ITERATIONS) {
+        throw new Error("Dropbox list pagination exceeded maximum iterations");
+      }
+      if (response.entries) {
+        for (const item of response.entries) {
+          // 只包含文件，跳过文件夹
+          if (item[".tag"] === "file") {
+            list.push({
+              name: item.name,
+              path: this.path,
+              size: item.size || 0,
+              digest: item.content_hash || "",
+              createtime: new Date(item.client_modified).getTime(),
+              updatetime: new Date(item.server_modified).getTime(),
+            });
+          }
         }
       }
+
+      // 检查是否有更多数据
+      if (!response.has_more) {
+        break;
+      }
+
+      // 获取下一页数据
+      response = await this.request("https://api.dropboxapi.com/2/files/list_folder/continue", {
+        method: "POST",
+        headers: myHeaders,
+        body: JSON.stringify({
+          cursor: response.cursor,
+        }),
+      });
     }
 
     return list;
@@ -196,8 +313,11 @@ export default class DropboxFileSystem implements FileSystem {
         }),
       });
       return true;
-    } catch (_) {
-      return false;
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        return false;
+      }
+      throw e;
     }
   }
 

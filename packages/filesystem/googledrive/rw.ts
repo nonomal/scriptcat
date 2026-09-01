@@ -1,13 +1,14 @@
-import type { File, FileReader, FileWriter } from "../filesystem";
+import { FileSystemError, isNotFoundError } from "../error";
+import type { FileInfo, FileReader, FileWriter } from "../filesystem";
 import { joinPath } from "../utils";
 import type GoogleDriveFileSystem from "./googledrive";
 
 export class GoogleDriveFileReader implements FileReader {
-  file: File;
+  file: FileInfo;
 
   fs: GoogleDriveFileSystem;
 
-  constructor(fs: GoogleDriveFileSystem, file: File) {
+  constructor(fs: GoogleDriveFileSystem, file: FileInfo) {
     this.fs = fs;
     this.file = file;
   }
@@ -16,7 +17,12 @@ export class GoogleDriveFileReader implements FileReader {
     // 首先获取文件ID
     const fileId = await this.fs.getFileId(joinPath(this.file.path, this.file.name));
     if (!fileId) {
-      return Promise.reject(new Error(`File not found: ${this.file.name}`));
+      throw new FileSystemError({
+        provider: "googledrive",
+        message: `File not found: ${this.file.name}`,
+        status: 404,
+        notFound: true,
+      });
     }
 
     // 获取文件内容
@@ -27,7 +33,7 @@ export class GoogleDriveFileReader implements FileReader {
     );
 
     if (data.status !== 200) {
-      return Promise.reject(await data.text());
+      throw await this.fs.createResponseError(data);
     }
 
     switch (type) {
@@ -51,6 +57,18 @@ export class GoogleDriveFileWriter implements FileWriter {
   }
 
   async write(content: string | Blob): Promise<void> {
+    try {
+      return await this.writeWithResolvedParent(content);
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+      this.fs.clearPathCache();
+      return await this.writeWithResolvedParent(content);
+    }
+  }
+
+  private async writeWithResolvedParent(content: string | Blob): Promise<void> {
     // 解析文件路径和文件名
     const pathParts = this.path.split("/").filter(Boolean);
     const fileName = pathParts.pop() || ""; // 获取文件名

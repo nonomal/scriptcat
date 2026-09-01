@@ -5,26 +5,67 @@ import { ScriptService } from "./script";
 import { ResourceService } from "./resource";
 import { ValueService } from "./value";
 import { RuntimeService } from "./runtime";
-import { type ServiceWorkerMessageSend } from "@Packages/message/window_message";
+import { type IOffscreenSend } from "@Packages/message/types";
 import { PopupService } from "./popup";
 import { SystemConfig } from "@App/pkg/config/config";
 import { SynchronizeService } from "./synchronize";
 import { SubscribeService } from "./subscribe";
+import { LogService } from "./log";
 import { ScriptDAO } from "@App/app/repo/scripts";
 import { SystemService } from "./system";
 import { type Logger, LoggerDAO } from "@App/app/repo/logger";
-import { initLocales, localePath, t } from "@App/locales/locales";
-import { getCurrentTab, InfoNotification } from "@App/pkg/utils/utils";
+import { initLocales, initLocalesPromise, localePath, t, watchLanguageChange } from "@App/locales/locales";
+import { getCurrentTab, isFirefox } from "@App/pkg/utils/utils";
 import { onTabRemoved, onUrlNavigated, setOnUserActionDomainChanged } from "./url_monitor";
 import { LocalStorageDAO } from "@App/app/repo/localStorage";
+import { FaviconDAO } from "@App/app/repo/favicon";
 import { onRegularUpdateCheckAlarm } from "./regular_updatecheck";
+import { InfoNotification, shouldAutoOpenChangelog } from "./utils";
+import { AgentService } from "@App/app/service/agent/service_worker/agent";
+import { extensionEnv, getExtensionUserAgentData } from "../extension/extension_env";
+import { cleanupStaleTempStorageEntries } from "./temp";
+import RuntimeLogger from "@App/app/logger/logger";
+import LoggerCore from "@App/app/logger/core";
+import { ExternalAccessApprovalService } from "@App/app/service/service_worker/external_access/approval";
+import {
+  ExternalAccessBridge,
+  type ExternalAccessWriteNotice,
+} from "@App/app/service/service_worker/external_access/bridge";
+import { ExternalAccessController } from "@App/app/service/service_worker/external_access/controller";
+import { ExternalAccessUIService } from "@App/app/service/service_worker/external_access/service";
+import { ExternalAccessConnectClient } from "@App/app/service/offscreen/client";
+import { hookFirefoxEventPageKeepAliveLoop, hookServiceWorkerKeepAliveLoop } from "../offscreen/keep_alive";
+import { NetworkRuleStateDAO } from "@App/app/repo/network_rule";
+import { NetworkRuleService } from "./network_rule";
+import { DeclarativeNetRequestUserRuleApplier, compileNetworkRules } from "./network_rule_compiler";
+
+// "直接允许" 写策略下 MCP 无需人工确认即执行了写操作，发系统通知让用户知晓（决策 #12 的知情兜底）。
+// kind=update 只由 scripts.edit.request 产生，故文案按「编辑」而非版本更新描述，避免被误读为例行升级。
+export function notifyExternalAccessWrite(notice: ExternalAccessWriteNotice): void {
+  const name = notice.name ?? "";
+  const body =
+    notice.kind === "install"
+      ? t("external_access:allow_notify_install", { name })
+      : notice.kind === "update"
+        ? t("external_access:allow_notify_update", { name })
+        : notice.kind === "enable"
+          ? t("external_access:allow_notify_enable", { name })
+          : notice.kind === "disable"
+            ? t("external_access:allow_notify_disable", { name })
+            : notice.kind === "delete"
+              ? t("external_access:allow_notify_delete", { name })
+              : t("external_access:allow_notify_generic", { name });
+  void InfoNotification(t("external_access:allow_notify_title"), body);
+}
 
 // service worker的管理器
 export default class ServiceWorkerManager {
+  private serviceLogger = LoggerCore.logger().with({ service: "service_worker" });
+
   constructor(
     private api: Server,
     private mq: IMessageQueue,
-    private sender: ServiceWorkerMessageSend
+    private offscreenSend: IOffscreenSend
   ) {}
 
   logger(data: Logger) {
@@ -33,14 +74,25 @@ export default class ServiceWorkerManager {
     dao.save(data);
   }
 
+  async getExtensionEnv(data: { requireUAD: boolean }) {
+    const result = { ...extensionEnv };
+    if (data.requireUAD) {
+      result.userAgentData = await getExtensionUserAgentData();
+    }
+    return result;
+  }
+
   initManager() {
     this.api.on("logger", this.logger.bind(this));
-    this.api.on("preparationOffscreen", async () => {
+    this.api.on("getExtensionEnv", this.getExtensionEnv.bind(this));
+    this.api.on("preparationOffscreen", async (data: { verified: boolean }) => {
       // 准备好环境
-      await this.sender.init();
-      this.mq.emit("preparationOffscreen", {});
+      await this.offscreenSend.init();
+      this.mq.emit("preparationOffscreen", data);
     });
-    this.sender.init();
+    this.offscreenSend.init();
+
+    const faviconDAO = new FaviconDAO();
 
     const scriptDAO = new ScriptDAO();
     scriptDAO.enableCache();
@@ -48,6 +100,7 @@ export default class ServiceWorkerManager {
     const localStorageDAO = new LocalStorageDAO();
 
     const systemConfig = new SystemConfig(this.mq);
+    hookFirefoxEventPageKeepAliveLoop(systemConfig);
 
     initLocales(systemConfig);
 
@@ -59,10 +112,11 @@ export default class ServiceWorkerManager {
     const value = new ValueService(this.api.group("value"), this.mq);
     const script = new ScriptService(systemConfig, this.api.group("script"), this.mq, value, resource, scriptDAO);
     script.init();
+
     const runtime = new RuntimeService(
       systemConfig,
       this.api.group("runtime"),
-      this.sender,
+      this.offscreenSend,
       this.mq,
       value,
       script,
@@ -75,7 +129,7 @@ export default class ServiceWorkerManager {
     popup.init();
     value.init(runtime, popup);
     const synchronize = new SynchronizeService(
-      this.sender,
+      this.offscreenSend,
       this.api.group("synchronize"),
       script,
       value,
@@ -85,10 +139,77 @@ export default class ServiceWorkerManager {
       scriptDAO
     );
     synchronize.init();
-    const subscribe = new SubscribeService(systemConfig, this.api.group("subscribe"), this.mq, script);
+    const subscribe = new SubscribeService(this.api.group("subscribe"), this.mq, script);
     subscribe.init();
-    const system = new SystemService(systemConfig, this.api.group("system"), this.sender);
+    const log = new LogService(this.api.group("log"), systemConfig);
+    log.init();
+    const system = new SystemService(
+      systemConfig,
+      this.api.group("system"),
+      this.offscreenSend,
+      this.mq,
+      scriptDAO,
+      faviconDAO
+    );
     system.init();
+
+    const networkRule = new NetworkRuleService(
+      this.api.group("networkRule"),
+      this.mq,
+      new NetworkRuleStateDAO(),
+      compileNetworkRules,
+      new DeclarativeNetRequestUserRuleApplier()
+    );
+    networkRule.init();
+
+    const agent = new AgentService(this.api.group("agent"), this.offscreenSend, resource);
+    agent.init();
+
+    const hasOffscreenDocument = typeof chrome.offscreen?.createDocument === "function";
+    if (hasOffscreenDocument) {
+      hookServiceWorkerKeepAliveLoop(systemConfig, this.mq, this.offscreenSend);
+    }
+
+    // 注入 AgentService 到 GMApi，使 Agent API 走权限验证通道
+    const gmApi = runtime.getGMApi();
+    if (gmApi) {
+      gmApi.setAgentService(agent);
+    }
+
+    // 外部接入桥接：运行期开关 external_access_enabled（由 ExternalAccessController.initialize 内部监听），默认关闭，
+    // 用户在设置里显式开启前不建立连接。Firefox 的 MV3 事件页生命周期未经验证/支持，显式排除。
+    if (!isFirefox()) {
+      const externalAccessApproval = new ExternalAccessApprovalService(script, scriptDAO, script.scriptCodeDAO);
+      const externalAccessBridge = new ExternalAccessBridge(
+        scriptDAO,
+        script.scriptCodeDAO,
+        externalAccessApproval,
+        () => systemConfig.getExternalAccessWritePolicy(),
+        () => systemConfig.getExternalAccessSourceReadPolicy(),
+        notifyExternalAccessWrite
+      );
+      const externalAccessController = new ExternalAccessController(
+        systemConfig,
+        externalAccessBridge,
+        this.mq,
+        this.api.group("externalAccessConnect"),
+        new ExternalAccessConnectClient(this.offscreenSend)
+      );
+      // Deferred bridge.response for blocking ops (write approval / source disclosure): the decide
+      // or bridge.cancel event resolves the persisted op and pushes the response back through the
+      // controller's offscreen relay — never a Promise left hanging in the (suspendable) SW.
+      externalAccessApproval.setResponder((requestId, response) =>
+        externalAccessController.sendBridgeResponse(requestId, response)
+      );
+      externalAccessController.initialize();
+      const externalAccessUIService = new ExternalAccessUIService(
+        this.api.group("externalAccess"),
+        externalAccessController,
+        externalAccessApproval,
+        systemConfig
+      );
+      externalAccessUIService.init();
+    }
 
     const regularScriptUpdateCheck = async () => {
       const res = await onRegularUpdateCheckAlarm(systemConfig, script, subscribe);
@@ -108,15 +229,16 @@ export default class ServiceWorkerManager {
               const isRead = items.notice !== data.notice ? false : items.isRead;
               systemConfig.setCheckUpdate({ ...data, isRead: isRead });
             })
-            .catch((e) => console.error("regularExtensionUpdateCheck: Check Error", e));
+            .catch((e) => this.serviceLogger.error("read extension update config failed", RuntimeLogger.E(e)));
         })
-        .catch((e) => console.error("regularExtensionUpdateCheck: Network Error", e));
+        .catch((e) => this.serviceLogger.error("check extension update failed", RuntimeLogger.E(e)));
     };
 
     this.mq.subscribe<any>("msgUpdatePageOpened", () => {
       pendingOpen = 0;
     });
 
+    const initTime = Date.now();
     // 定时器处理
     chrome.alarms.onAlarm.addListener((alarm) => {
       const lastError = chrome.runtime.lastError;
@@ -124,21 +246,39 @@ export default class ServiceWorkerManager {
         console.error("chrome.runtime.lastError in chrome.alarms.onAlarm:", lastError);
         // 非预期的异常API错误，停止处理
       }
+      const now = Date.now();
+      const isJustInit = now - initTime < 30_000; // 浏览器刚开
+      const isCarryoverAlarm = alarm.scheduledTime < initTime; // Alarm排程早于SW初始化
+      const needsWarmupDelay = isJustInit || isCarryoverAlarm;
       switch (alarm.name) {
         case "checkScriptUpdate":
           regularScriptUpdateCheck();
           break;
         case "cloudSync":
-          // 进行一次云同步
-          systemConfig.getCloudSync().then((config) => {
-            synchronize.buildFileSystem(config).then((fs) => {
-              synchronize.syncOnce(config, fs);
-            });
-          });
+          // 闹钟是启用之后唯一的周期性同步入口（冷启动不再同步），cloudSyncOnce 自带启用校验
+          // 与失败状态写入；连接失败必须在这里收住，否则每轮闹钟都留下一个未捕获 rejection
+          synchronize
+            .cloudSyncOnce()
+            .catch((e) => this.serviceLogger.error("cloud sync alarm failed", RuntimeLogger.E(e)));
           break;
         case "checkUpdate":
           // 检查扩展更新
           regularExtensionUpdateCheck();
+          break;
+        case "agentTaskScheduler":
+          agent.onSchedulerTick();
+          break;
+        case "cleanupTempStorage":
+          // 避免浏览器打开时立即清除。先等tabs载入一下
+          setTimeout(cleanupStaleTempStorageEntries, needsWarmupDelay ? 45_000 : 100);
+          break;
+        case "cleanupTrash":
+          script.cleanupExpiredTrash();
+          break;
+        case "cleanupLogs":
+          log
+            .cleanupExpiredLogs()
+            .catch((e) => this.serviceLogger.error("cleanup expired logs failed", RuntimeLogger.E(e)));
           break;
       }
     });
@@ -168,13 +308,72 @@ export default class ServiceWorkerManager {
       }
     });
 
-    // 监听配置变化
-    systemConfig.addListener("cloud_sync", (value) => {
-      synchronize.cloudSyncConfigChange(value);
+    // Agent 定时任务调度器 alarm（每分钟触发一次）
+    chrome.alarms.get("agentTaskScheduler", (alarm) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        console.error("chrome.runtime.lastError in chrome.alarms.get:", lastError);
+      }
+      if (!alarm) {
+        chrome.alarms.create(
+          "agentTaskScheduler",
+          {
+            delayInMinutes: 1,
+            periodInMinutes: 1,
+          },
+          () => {
+            const lastError = chrome.runtime.lastError;
+            if (lastError) {
+              console.error("chrome.runtime.lastError in chrome.alarms.create:", lastError);
+            }
+          }
+        );
+      }
     });
-    // 启动一次云同步
-    systemConfig.getCloudSync().then((config) => {
-      synchronize.cloudSyncConfigChange(config);
+
+    // 云同步
+    systemConfig.watch("cloud_sync", (value, previous) => {
+      synchronize.cloudSyncConfigChange(value, previous);
+    });
+
+    // 定期清理过期的临时安装信息
+    chrome.alarms.create("cleanupTempStorage", { periodInMinutes: 30 });
+
+    // 定期清理回收站中过期的脚本(30 天精度无需更细)。
+    // 必须先 get 再 create(同 checkUpdate/agentTaskScheduler):create 同名 alarm 会重置倒计时,
+    // 活跃使用时 SW 频繁冷启动,无条件 create 会让 12 小时的闹钟永远数不满、清理永远不触发。
+    chrome.alarms.get("cleanupTrash", (alarm) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        console.error("chrome.runtime.lastError in chrome.alarms.get:", lastError);
+        // 非预期的异常API错误，停止处理
+      }
+      if (!alarm) {
+        chrome.alarms.create("cleanupTrash", { periodInMinutes: 12 * 60 }, () => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            console.error("chrome.runtime.lastError in chrome.alarms.create:", lastError);
+            console.error("Chrome alarm is unable to create. Please check whether limit is reached.");
+          }
+        });
+      }
+    });
+
+    // 定期清理超过保留天数的运行日志。先 get 再 create，避免 SW 冷启动重置倒计时。
+    chrome.alarms.get("cleanupLogs", (alarm) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        console.error("chrome.runtime.lastError in chrome.alarms.get:", lastError);
+      }
+      if (!alarm) {
+        chrome.alarms.create("cleanupLogs", { delayInMinutes: 1, periodInMinutes: 12 * 60 }, () => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            console.error("chrome.runtime.lastError in chrome.alarms.create:", lastError);
+            console.error("Chrome alarm is unable to create. Please check whether limit is reached.");
+          }
+        });
+      }
     });
 
     if (process.env.NODE_ENV === "production") {
@@ -184,41 +383,47 @@ export default class ServiceWorkerManager {
           console.error("chrome.runtime.lastError in chrome.runtime.onInstalled:", lastError);
           // chrome.runtime.onInstalled API出错不进行后续处理
         }
-        if (details.reason === "install") {
-          chrome.tabs.create({ url: `${DocumentationSite}${localePath}/docs/use/install_comple` });
-        } else if (details.reason === "update") {
-          const url = `${DocumentationSite}/docs/change/${ExtVersion.includes("-") ? "beta-changelog/" : ""}#${ExtVersion}`;
-          getCurrentTab()
-            .then((tab) => {
-              // 检查是否正在播放视频，或者窗口未激活
-              const openInBackground = !tab || tab.audible === true || !tab.active;
-              // chrome.tabs.create 传回 Promise<chrome.tabs.Tab>
-              return chrome.tabs.create({
+        initLocalesPromise.then(() => {
+          if (details.reason === "install") {
+            chrome.tabs.create({ url: `${DocumentationSite}${localePath}/docs/use/install_comple` });
+          } else if (details.reason === "update") {
+            const url = `${DocumentationSite}${localePath}/docs/change/${ExtVersion.includes("-") ? "beta-changelog/" : ""}#${ExtVersion}`;
+            // 如果只是修复版本，只弹出通知不打开页面
+            // beta版本还是每次都打开更新页面
+            InfoNotification(
+              t("popup:ext_update_notification"),
+              t("popup:ext_update_notification_desc", { version: ExtVersion }),
+              {
                 url,
-                active: !openInBackground,
-                index: !tab ? undefined : tab.index + 1,
-                windowId: !tab ? undefined : tab.windowId,
-              });
-            })
-            .then((_createdTab) => {
-              // 当新 Tab 成功建立时才执行
-              InfoNotification(
-                t("ext_update_notification"),
-                t("ext_update_notification_desc", { version: ExtVersion })
-              );
-            })
-            .catch((e) => {
-              console.error(e);
-            });
-        }
-      });
+              }
+            );
+            if (shouldAutoOpenChangelog(ExtVersion)) {
+              getCurrentTab()
+                .then((tab) => {
+                  // 检查是否正在播放视频，或者窗口未激活
+                  const openInBackground = !tab || tab.audible === true || !tab.active;
+                  // chrome.tabs.create 传回 Promise<chrome.tabs.Tab>
+                  return chrome.tabs.create({
+                    url,
+                    active: !openInBackground,
+                    index: !tab ? undefined : tab.index + 1,
+                    windowId: !tab ? undefined : tab.windowId,
+                  });
+                })
+                .catch((e) => this.serviceLogger.error("open extension changelog failed", { url }, RuntimeLogger.E(e)));
+            }
+          }
+        });
 
-      // 监听扩展卸载事件
-      chrome.runtime.setUninstallURL(`${DocumentationSite}${localePath}/uninstall`, () => {
-        const lastError = chrome.runtime.lastError;
-        if (lastError) {
-          console.error("chrome.runtime.lastError in chrome.runtime.setUninstallURL:", lastError);
-        }
+        // 监听扩展卸载事件
+        watchLanguageChange(() => {
+          chrome.runtime.setUninstallURL(`${DocumentationSite}${localePath}/uninstall`, () => {
+            const lastError = chrome.runtime.lastError;
+            if (lastError) {
+              console.error("chrome.runtime.lastError in chrome.runtime.setUninstallURL:", lastError);
+            }
+          });
+        });
       });
     }
 
@@ -240,7 +445,9 @@ export default class ServiceWorkerManager {
             // 如该网域没有任何有效脚本则忽略
             const domain = newDomain;
             const anyOpened = await script.openBatchUpdatePage({
-              q: domain ? `site=${domain}` : "",
+              // https://github.com/scriptscat/scriptcat/issues/1087
+              // 关于 autoclose，日后再检讨 UI/UX 设计
+              q: domain ? `autoclose=30&site=${domain}` : "autoclose=30",
               dontCheckNow: true,
             });
             if (anyOpened) {

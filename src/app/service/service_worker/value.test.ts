@@ -3,19 +3,28 @@ import { ValueService } from "./value";
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "crypto";
 import type { Script } from "@App/app/repo/scripts";
-import { SCRIPT_STATUS_ENABLE, SCRIPT_TYPE_NORMAL } from "@App/app/repo/scripts";
+import { SCRIPT_RUN_STATUS_COMPLETE, SCRIPT_STATUS_ENABLE, SCRIPT_TYPE_NORMAL } from "@App/app/repo/scripts";
 import type { Group } from "@Packages/message/server";
 import type { IMessageQueue } from "@Packages/message/message_queue";
 import type { ScriptDAO } from "@App/app/repo/scripts";
-import type { ValueDAO } from "@App/app/repo/value";
+import { ValueDAO, type Value } from "@App/app/repo/value";
 import { MockMessage } from "@Packages/message/mock_message";
 import { Server } from "@Packages/message/server";
 import EventEmitter from "eventemitter3";
 import { MessageQueue } from "@Packages/message/message_queue";
 import type { ValueUpdateSender } from "../content/types";
 import { getStorageName } from "@App/pkg/utils/utils";
+import type { TKeyValuePair } from "@App/pkg/utils/message_value";
+import { encodeRValue } from "@App/pkg/utils/message_value";
+import { TrashScriptDAO, type TrashScript } from "@App/app/repo/trash_script";
+import type { TDeleteScript } from "@App/app/service/queue";
+import { createMockOPFS } from "@App/app/repo/test-helpers";
+import type { RuntimeService } from "./runtime";
+import type { PopupService } from "./popup";
 
 initTestEnv();
+
+beforeEach(() => createMockOPFS());
 
 /**
  * ValueService.setValue 方法的单元测试
@@ -80,8 +89,8 @@ describe("ValueService - setValue 方法测试", () => {
     } as any;
     valueService.valueDAO = mockValueDAO;
 
-    // Mock pushValueToTab 方法
-    valueService.pushValueToTab = vi.fn();
+    // Mock pushValueUpdate 方法
+    valueService.pushValueUpdate = vi.fn();
 
     // Mock mq.emit 方法
     mockMessageQueue.emit = vi.fn();
@@ -104,15 +113,22 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockValueDAO.save).mockResolvedValue({} as any);
 
     // 执行测试
-    await valueService.setValue(mockScript.uuid, "testId-4021", key, value, mockSender);
+    await valueService.setValues({
+      uuid: mockScript.uuid,
+      id: "testId-4021",
+      keyValuePairs: [[key, encodeRValue(value)]],
+      valueSender: mockSender,
+      isReplace: false,
+    });
 
     // 验证结果
     expect(mockScriptDAO.get).toHaveBeenCalledWith(mockScript.uuid);
     expect(mockValueDAO.get).toHaveBeenCalled();
     expect(mockValueDAO.save).toHaveBeenCalled();
-    expect(valueService.pushValueToTab).toHaveBeenCalledTimes(1);
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(1);
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       1,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4021",
@@ -125,8 +141,6 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: true,
       })
     );
-    expect(mockMessageQueue.emit).toHaveBeenCalledTimes(1);
-    expect(mockMessageQueue.emit).toHaveBeenCalledWith("valueUpdate", { script: mockScript, valueUpdated: true });
 
     // 验证保存的数据结构
     const saveCall = vi.mocked(mockValueDAO.save).mock.calls[0];
@@ -151,15 +165,22 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockValueDAO.save).mockResolvedValue({} as any);
 
     // 执行测试
-    await valueService.setValue(mockScript.uuid, "testId-4022", key, value, mockSender);
+    await valueService.setValues({
+      uuid: mockScript.uuid,
+      id: "testId-4022",
+      keyValuePairs: [[key, encodeRValue(value)]],
+      valueSender: mockSender,
+      isReplace: false,
+    });
 
     // 验证结果
     expect(mockScriptDAO.get).toHaveBeenCalledWith(mockScript.uuid);
     expect(mockValueDAO.get).toHaveBeenCalled();
     expect(mockValueDAO.save).toHaveBeenCalled();
-    expect(valueService.pushValueToTab).toHaveBeenCalledTimes(1);
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(1);
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       1,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4022",
@@ -172,8 +193,6 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: true,
       })
     );
-    expect(mockMessageQueue.emit).toHaveBeenCalledTimes(1);
-    expect(mockMessageQueue.emit).toHaveBeenCalledWith("valueUpdate", { script: mockScript, valueUpdated: true });
 
     // 验证保存的数据结构
     const saveCall = vi.mocked(mockValueDAO.save).mock.calls[0];
@@ -207,15 +226,22 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockValueDAO.save).mockResolvedValue({} as any);
 
     // 执行测试
-    await valueService.setValue(mockScript.uuid, "testId-4023", key, newValue, mockSender);
+    await valueService.setValues({
+      uuid: mockScript.uuid,
+      id: "testId-4023",
+      keyValuePairs: [[key, encodeRValue(newValue)]],
+      valueSender: mockSender,
+      isReplace: false,
+    });
 
     // 验证结果
     expect(mockScriptDAO.get).toHaveBeenCalledWith(mockScript.uuid);
     expect(mockValueDAO.get).toHaveBeenCalled();
     expect(mockValueDAO.save).toHaveBeenCalled();
-    expect(valueService.pushValueToTab).toHaveBeenCalledTimes(1);
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(1);
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       1,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4023",
@@ -228,11 +254,6 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: true,
       })
     );
-    expect(mockMessageQueue.emit).toHaveBeenCalledTimes(1);
-    expect(mockMessageQueue.emit).toHaveBeenCalledWith("valueUpdate", {
-      script: mockScript,
-      valueUpdated: true,
-    });
 
     // 验证保存的数据被正确更新
     const saveCall = vi.mocked(mockValueDAO.save).mock.calls[0];
@@ -262,15 +283,22 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockValueDAO.get).mockResolvedValue(existingValueModel);
 
     // 执行测试
-    await valueService.setValue(mockScript.uuid, "testId-4024", key, value, mockSender);
+    await valueService.setValues({
+      uuid: mockScript.uuid,
+      id: "testId-4024",
+      keyValuePairs: [[key, encodeRValue(value)]],
+      valueSender: mockSender,
+      isReplace: false,
+    });
 
     // 验证结果 - 不应该保存或发送更新
     expect(mockScriptDAO.get).toHaveBeenCalledWith(mockScript.uuid);
     expect(mockValueDAO.get).toHaveBeenCalled();
     expect(mockValueDAO.save).not.toHaveBeenCalled(); // 值未改变，不应该保存
-    expect(valueService.pushValueToTab).toHaveBeenCalledTimes(1);
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(1);
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       1,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4024",
@@ -283,8 +311,6 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: false,
       })
     ); // 值未改变
-    expect(mockMessageQueue.emit).toHaveBeenCalledTimes(1);
-    expect(mockMessageQueue.emit).toHaveBeenCalledWith("valueUpdate", { script: mockScript, valueUpdated: false }); // 值未改变
   });
 
   it("当设置值为undefined时应该删除该键", async () => {
@@ -308,7 +334,13 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockValueDAO.save).mockResolvedValue({} as any);
 
     // 执行测试 - 设置值为undefined
-    await valueService.setValue(mockScript.uuid, "testId-4025", key, undefined, mockSender);
+    await valueService.setValues({
+      uuid: mockScript.uuid,
+      id: "testId-4025",
+      keyValuePairs: [[key, encodeRValue(undefined)]],
+      valueSender: mockSender,
+      isReplace: false,
+    });
 
     // 验证结果
     expect(mockValueDAO.save).toHaveBeenCalled();
@@ -329,14 +361,21 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockScriptDAO.get).mockResolvedValue(undefined);
 
     // 执行测试并验证抛出错误
+    const keyValuePairs1 = [["testKey", encodeRValue("testValue")]] satisfies TKeyValuePair[];
     await expect(
-      valueService.setValue(nonExistentUuid, "testId-4026", "testKey", "testValue", mockSender)
+      valueService.setValues({
+        uuid: nonExistentUuid,
+        id: "testId-4026",
+        keyValuePairs: keyValuePairs1,
+        valueSender: mockSender,
+        isReplace: false,
+      })
     ).rejects.toThrow("script not found");
 
     // 验证不会执行后续操作
     expect(mockValueDAO.get).not.toHaveBeenCalled();
     expect(mockValueDAO.save).not.toHaveBeenCalled();
-    expect(valueService.pushValueToTab).not.toHaveBeenCalled();
+    expect(valueService.pushValueUpdate).not.toHaveBeenCalled();
     expect(mockMessageQueue.emit).toHaveBeenCalledTimes(0);
   });
 
@@ -353,19 +392,37 @@ describe("ValueService - setValue 方法测试", () => {
     vi.mocked(mockScriptDAO.get).mockResolvedValue(mockScript);
     vi.mocked(mockValueDAO.get).mockResolvedValue(undefined);
     vi.mocked(mockValueDAO.save).mockResolvedValue({} as any);
+    expect(mockScriptDAO.get).toHaveBeenCalledTimes(0);
+    expect(mockValueDAO.save).toHaveBeenCalledTimes(0);
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(0);
 
     // 并发执行两个setValue操作
+    const keyValuePairs1 = [[key1, encodeRValue(value1)]] satisfies TKeyValuePair[];
+    const keyValuePairs2 = [[key2, encodeRValue(value2)]] satisfies TKeyValuePair[];
     await Promise.all([
-      valueService.setValue(mockScript.uuid, "testId-4041", key1, value1, mockSender),
-      valueService.setValue(mockScript.uuid, "testId-4042", key2, value2, mockSender),
+      valueService.setValues({
+        uuid: mockScript.uuid,
+        id: "testId-4041",
+        keyValuePairs: keyValuePairs1,
+        valueSender: mockSender,
+        isReplace: false,
+      }),
+      valueService.setValues({
+        uuid: mockScript.uuid,
+        id: "testId-4042",
+        keyValuePairs: keyValuePairs2,
+        valueSender: mockSender,
+        isReplace: false,
+      }),
     ]);
 
     // 验证两个操作都被调用
     expect(mockScriptDAO.get).toHaveBeenCalledTimes(2);
     expect(mockValueDAO.save).toHaveBeenCalledTimes(2);
-    expect(valueService.pushValueToTab).toHaveBeenCalledTimes(2);
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenCalledTimes(2);
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       1,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4041",
@@ -378,8 +435,9 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: true,
       })
     );
-    expect(valueService.pushValueToTab).toHaveBeenNthCalledWith(
+    expect(valueService.pushValueUpdate).toHaveBeenNthCalledWith(
       2,
+      mockScript,
       expect.objectContaining({
         entries: expect.any(Object),
         id: "testId-4042",
@@ -392,8 +450,81 @@ describe("ValueService - setValue 方法测试", () => {
         valueUpdated: true,
       })
     );
-    expect(mockMessageQueue.emit).toHaveBeenCalledTimes(2);
-    expect(mockMessageQueue.emit).toHaveBeenNthCalledWith(1, "valueUpdate", { script: mockScript, valueUpdated: true });
-    expect(mockMessageQueue.emit).toHaveBeenNthCalledWith(2, "valueUpdate", { script: mockScript, valueUpdated: true });
+  });
+});
+
+describe("ValueService —— 共享 storagename 的回收站感知", () => {
+  beforeEach(async () => {
+    await chrome.storage.local.clear();
+  });
+
+  it("彻底删除某脚本时,若共用同一 storagename 的脚本尚在回收站,则不得删除共享 value", async () => {
+    const eventEmitter = new EventEmitter<string, any>();
+    const server = new Server("test", new MockMessage(eventEmitter));
+    const mq = new MessageQueue();
+    const service = new ValueService(server.group("value"), mq);
+    service.init({} as RuntimeService, {} as PopupService);
+
+    const trashDAO = new TrashScriptDAO();
+    const valueDAO = new ValueDAO();
+    const shared = "shared-storage";
+
+    // A、B 都声明 @storagename "shared-storage",两者都已在回收站
+    // 注意:metadata 的 key 必须是全小写 storagename,getStorageName 只认这个
+    const base: Omit<TrashScript, "uuid" | "name"> = {
+      namespace: "ns",
+      type: SCRIPT_TYPE_NORMAL,
+      status: SCRIPT_STATUS_ENABLE,
+      sort: 0,
+      runStatus: SCRIPT_RUN_STATUS_COMPLETE,
+      createtime: Date.now(),
+      checktime: Date.now(),
+      metadata: { storagename: [shared] },
+      deleteTime: Date.now(),
+      deleteBy: "user",
+    };
+    await trashDAO.save({ ...base, uuid: "A", name: "脚本A" });
+    await trashDAO.save({ ...base, uuid: "B", name: "脚本B" });
+    const sharedValue: Value = {
+      uuid: "A",
+      storageName: shared,
+      data: { k: "别删我" },
+      createtime: Date.now(),
+      updatetime: Date.now(),
+    };
+    await valueDAO.save(shared, sharedValue);
+
+    // 彻底删除 B。必须先把 B 移出回收站再广播,以忠实还原 purgeScripts 的真实顺序
+    // (它先 trashScriptDAO.deletes(uuids) 成功后才 publish)。
+    // 若留着 B 不删,回收站查询会因 B 自身而非目标 A 命中 → 用例失去分辨力。
+    await trashDAO.delete("B");
+    mq.publish<TDeleteScript[]>("deleteScripts", [{ uuid: "B", storageName: shared, type: 1 }]);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 此刻回收站里只剩 A。A 还在等着被还原,它的 value 必须活着
+    expect(await valueDAO.get(shared)).toBeDefined();
+  });
+
+  it("两张表都没有脚本使用该 storagename 时才删除 value", async () => {
+    const eventEmitter = new EventEmitter<string, any>();
+    const server = new Server("test", new MockMessage(eventEmitter));
+    const mq = new MessageQueue();
+    const service = new ValueService(server.group("value"), mq);
+    service.init({} as RuntimeService, {} as PopupService);
+
+    const valueDAO = new ValueDAO();
+    const lonely = "lonely-storage";
+    await valueDAO.save(lonely, {
+      uuid: "C",
+      storageName: lonely,
+      data: { k: "v" },
+      createtime: Date.now(),
+      updatetime: Date.now(),
+    });
+
+    mq.publish<TDeleteScript[]>("deleteScripts", [{ uuid: "C", storageName: lonely, type: 1 }]);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await valueDAO.get(lonely)).toBeUndefined();
   });
 });

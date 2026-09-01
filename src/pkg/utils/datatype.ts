@@ -5,7 +5,7 @@ export const blobToUint8Array = async (blob: Blob): Promise<Uint8Array<ArrayBuff
   if (typeof blob?.arrayBuffer === "function") return new Uint8Array(await blob.arrayBuffer());
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onloadend = function () {
       resolve(new Uint8Array(reader.result as ArrayBuffer));
     };
     reader.onerror = reject;

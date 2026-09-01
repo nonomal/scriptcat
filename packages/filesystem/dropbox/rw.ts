@@ -1,13 +1,13 @@
-import type { File, FileReader, FileWriter } from "../filesystem";
+import type { FileInfo, FileReader, FileWriter } from "../filesystem";
 import { joinPath } from "../utils";
 import type DropboxFileSystem from "./dropbox";
 
 export class DropboxFileReader implements FileReader {
-  file: File;
+  file: FileInfo;
 
   fs: DropboxFileSystem;
 
-  constructor(fs: DropboxFileSystem, file: File) {
+  constructor(fs: DropboxFileSystem, file: FileInfo) {
     this.fs = fs;
     this.file = file;
   }
@@ -35,7 +35,7 @@ export class DropboxFileReader implements FileReader {
     );
 
     if (data.status !== 200) {
-      return Promise.reject(await data.text());
+      throw await this.fs.createResponseError(data);
     }
 
     switch (type) {

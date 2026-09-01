@@ -1,8 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { isBase64, parseUrlSRI, getCombinedMeta, selfMetadataUpdate, getUserScriptRegister } from "./utils";
-import type { SCMetadata, Script } from "@App/app/repo/scripts";
+import {
+  isBase64,
+  parseUrlSRI,
+  getCombinedMeta,
+  selfMetadataUpdate,
+  getUserScriptRegister,
+  compileInjectionCode,
+  shouldAutoOpenChangelog,
+  scriptURLPatternResults,
+} from "./utils";
+import type { SCMetadata, Script, ScriptRunResource } from "@App/app/repo/scripts";
+import { SELF_METADATA_ONLY_RUN_ON_URL } from "@App/app/repo/metadata";
 import { SCRIPT_TYPE_NORMAL, SCRIPT_STATUS_ENABLE, SCRIPT_RUN_STATUS_COMPLETE } from "@App/app/repo/scripts";
 import type { ScriptMatchInfo } from "./types";
+import { extractUrlPatterns, RuleTypeBit } from "@App/pkg/utils/url_matcher";
 
 describe.concurrent("parseUrlSRI", () => {
   it.concurrent("should parse URL SRI", () => {
@@ -55,10 +66,10 @@ describe.concurrent("parseUrlSRI", () => {
     expect(result.hash).toBeUndefined();
   });
   it.concurrent("不规则的SRI", () => {
-    const url = "https://example.com/script.js#sha256";
+    const url = "https://example.com/script.js#sha256"; // 格式错误不视为哈希值
     const result = parseUrlSRI(url);
     expect(result.url).toEqual("https://example.com/script.js");
-    expect(result.hash).toEqual({});
+    expect(result.hash).toBeUndefined();
     const url2 = "https://example.com/script.js#sha256=abc123==,md5";
     const result2 = parseUrlSRI(url2);
     expect(result2.url).toEqual("https://example.com/script.js");
@@ -96,6 +107,18 @@ describe.concurrent("isBase64", () => {
       )
     ).toBe(false);
     expect(isBase64("")).toBe(false);
+  });
+});
+
+describe.concurrent("shouldAutoOpenChangelog", () => {
+  it.concurrent("beta 版本更新时应该自动打开更新页面", () => {
+    expect(shouldAutoOpenChangelog("1.5.0-beta")).toBe(true);
+    expect(shouldAutoOpenChangelog("1.5.1-beta.2")).toBe(true);
+  });
+
+  it.concurrent("正式版仅在次版本发布时自动打开更新页面", () => {
+    expect(shouldAutoOpenChangelog("1.5.0")).toBe(true);
+    expect(shouldAutoOpenChangelog("1.5.1")).toBe(false);
   });
 });
 
@@ -143,6 +166,14 @@ describe.concurrent("getCombinedMeta", () => {
     expect(result.grant).toEqual([]);
     expect(result.exclude).toEqual(["https://admin.com/*"]);
   });
+
+  it.concurrent("不应把 onlyRunOnUrl provenance 合并为有效 metadata", () => {
+    const result = getCombinedMeta(baseMetadata, {
+      [SELF_METADATA_ONLY_RUN_ON_URL]: ["*://current.example/*"],
+    });
+
+    expect(result).toEqual(baseMetadata);
+  });
 });
 
 describe.concurrent("selfMetadataUpdate", () => {
@@ -180,14 +211,36 @@ describe.concurrent("selfMetadataUpdate", () => {
     expect(result).not.toBe(script);
   });
 
-  it.concurrent("应该删除空字段并处理空对象", () => {
+  it.concurrent("传入 undefined 应删除用户覆盖并处理空对象", () => {
+    const script = createMockScript({
+      exclude: ["https://admin.com/*"],
+    });
+
+    const result = selfMetadataUpdate(script, "exclude", undefined);
+
+    expect(result.selfMetadata).toBeUndefined();
+  });
+
+  it.concurrent("传入空集合应保存为空覆盖而非删除用户覆盖", () => {
     const script = createMockScript({
       exclude: ["https://admin.com/*"],
     });
 
     const result = selfMetadataUpdate(script, "exclude", new Set());
 
-    expect(result.selfMetadata).toBeUndefined();
+    // 空覆盖代表「用户显式清空」，与 undefined(撤销覆盖、回落脚本自带 metadata) 是两回事
+    expect(result.selfMetadata).toEqual({ exclude: [] });
+  });
+
+  it.concurrent("传入 undefined 应只删除指定 key，保留其他覆盖", () => {
+    const script = createMockScript({
+      exclude: ["https://admin.com/*"],
+      match: ["https://user.com/*"],
+    });
+
+    const result = selfMetadataUpdate(script, "exclude", undefined);
+
+    expect(result.selfMetadata).toEqual({ match: ["https://user.com/*"] });
   });
 
   it.concurrent("应该处理没有 selfMetadata 的脚本", () => {
@@ -254,5 +307,76 @@ describe.concurrent("getUserScriptRegister", () => {
     expect(result.registerScript.allFrames).toBe(false);
     expect(result.registerScript.world).toBe("MAIN");
     expect(result.registerScript.runAt).toBe("document_end");
+  });
+});
+
+describe.concurrent("compileInjectionCode", () => {
+  const createMockScriptRes = (overrides: Partial<ScriptRunResource> = {}): ScriptRunResource => ({
+    uuid: "test-uuid",
+    name: "Test Script",
+    namespace: "test.namespace",
+    type: 1,
+    status: 1,
+    sort: 0,
+    runStatus: "complete",
+    createtime: Date.now(),
+    checktime: Date.now(),
+    code: "console.log('test');",
+    value: {},
+    flag: "#-test-uuid",
+    resource: {},
+    metadata: {},
+    originalMetadata: {},
+    ...overrides,
+  });
+
+  it.concurrent("unwrap 脚本走 scriptlet 编译路径", () => {
+    const scriptRes = createMockScriptRes({
+      metadata: { unwrap: [""] },
+    });
+    const patterns = extractUrlPatterns(["@match https://example.com/*"]);
+    const result = compileInjectionCode(scriptRes, scriptRes.code, patterns);
+
+    // 包含 URL 条件包裹和 flag 注册
+    expect(result).toMatch(/^if\(/);
+    expect(result).toContain(`window['#-test-uuid']=function(){};`);
+    // 不包含沙箱封装
+    expect(result).not.toContain("with(arguments[0]||this.$)");
+    expect(result).not.toContain("return(async function(){");
+  });
+
+  it.concurrent("非 unwrap 脚本走普通编译路径", () => {
+    const scriptRes = createMockScriptRes({
+      metadata: {},
+    });
+    const patterns = extractUrlPatterns(["@match https://example.com/*"]);
+    const result = compileInjectionCode(scriptRes, scriptRes.code, patterns);
+
+    // 包含沙箱封装
+    expect(result).toContain("with(arguments[0]||this.$)");
+    expect(result).toContain("return(async function(){");
+    // 使用 compileInjectScript 包裹（window[flag] = function(){...}）
+    expect(result).toContain("window['#-test-uuid']");
+  });
+});
+
+describe.concurrent("scriptURLPatternResults", () => {
+  const createScriptRes = (metadata: SCMetadata, selfMetadata?: SCMetadata) => ({
+    metadata: selfMetadata ? getCombinedMeta(metadata, selfMetadata) : metadata,
+    originalMetadata: metadata,
+    selfMetadata,
+  });
+
+  it.concurrent("无任何匹配规则的脚本应返回 null", () => {
+    expect(scriptURLPatternResults(createScriptRes({ name: ["no match"] }))).toBeNull();
+  });
+
+  it.concurrent("用户把匹配清空后应保留原始规则，使脚本仍能在 Popup 中被恢复", () => {
+    const result = scriptURLPatternResults(createScriptRes({ match: ["*://example.com/*"] }, { match: [] }));
+
+    // 生效规则不含任何 inclusion => 不匹配任何站点；
+    // 原始规则仍在 => Popup 仍以「未生效」列出该脚本，可点「允许在此执行」恢复
+    expect(result!.scriptUrlPatterns.some((rule) => rule.ruleType & RuleTypeBit.INCLUSION)).toBe(false);
+    expect(result!.originalUrlPatterns.map((rule) => rule.patternString)).toEqual(["*://example.com/*"]);
   });
 });

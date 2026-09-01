@@ -1,5 +1,6 @@
 import chromeMock from "@Packages/chrome-extension-mock";
-import { initTestEnv } from "./utils";
+import type Runtime from "@Packages/chrome-extension-mock/runtime";
+import { initTestEnv } from "./initTestEnv";
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 import { MockRequest } from "./mocks/request";
@@ -7,13 +8,90 @@ import { MockBlob } from "./mocks/blob";
 import { MockResponse } from "./mocks/response";
 import { mockFetch } from "./mocks/fetch";
 
+function createStorageMock(): Storage {
+  const store = new Map<string, string>();
+  return new Proxy(
+    {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(String(k), String(v)),
+      removeItem: (k: string) => void store.delete(k),
+      clear: () => store.clear(),
+      key: (i: number) => [...store.keys()][i] ?? null,
+    } as Storage,
+    {
+      get: (t, p) => (p === "length" ? store.size : p in t ? (t as any)[p] : store.get(p as string)),
+      set: (t, p, v) => (p in t ? false : (store.set(p as string, String(v)), true)),
+      deleteProperty: (_, p) => store.delete(p as string),
+      has: (t, p) => p in t || p === "length" || store.has(p as string),
+      ownKeys: () => [...store.keys()],
+      getOwnPropertyDescriptor: (_, p) =>
+        store.has(p as string)
+          ? { value: store.get(p as string), writable: true, enumerable: true, configurable: true }
+          : undefined,
+    }
+  );
+}
+
+// Ensure localStorage exists
+if (typeof window !== "undefined" && !global.localStorage?.getItem) {
+  vi.stubGlobal("localStorage", createStorageMock());
+}
+
 vi.stubGlobal("chrome", chromeMock);
 chromeMock.init();
 initTestEnv();
 
-chromeMock.runtime.getURL = vi.fn().mockImplementation((path: string) => {
+chromeMock.runtime.getURL = vi.fn().mockImplementation(function (this: Runtime, path: string) {
+  if (this.__mockGetURLToExtensionTest) return `https://extension.test${path}`;
   return `chrome-extension://${chrome.runtime.id}${path}`;
 });
+
+const runtimeWithManifest = chromeMock.runtime as typeof chromeMock.runtime & {
+  getManifest: ReturnType<typeof vi.fn>;
+};
+
+runtimeWithManifest.getManifest = vi.fn().mockReturnValue({
+  optional_permissions: [],
+  permissions: [],
+  host_permissions: [],
+});
+
+// ---- 修正 DOM 测试环境中的 adoptedStyleSheets 兼容问题 ----
+if (typeof document !== "undefined") {
+  let fixAdoptedStyleSheets = false;
+  if (!document.adoptedStyleSheets) fixAdoptedStyleSheets = true;
+  else {
+    try {
+      document.adoptedStyleSheets = document.adoptedStyleSheets.concat([]);
+    } catch {
+      fixAdoptedStyleSheets = true;
+    }
+  }
+  if (fixAdoptedStyleSheets) {
+    //@ts-ignore
+    delete document.adoptedStyleSheets;
+    //@ts-ignore
+    delete Document.prototype.adoptedStyleSheets;
+
+    const map = new WeakMap<any, any>();
+    Object.defineProperty(Document.prototype, "adoptedStyleSheets", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        let res = map.get(this);
+        if (!res) {
+          map.set(this, (res = []));
+        }
+        return res;
+      },
+      set(v) {
+        map.set(this, Object.freeze([...v])); // 模拟初版的 adoptedStyleSheets 无法 .push
+        return true;
+      },
+    });
+  }
+}
+// ---- --------------------------------------------- ----
 
 const isPrimitive = (x: any) => x !== Object(x);
 
@@ -125,10 +203,9 @@ if (!("onresize" in global)) {
     configurable: true,
     enumerable: true,
     set(_newVal) {
-      console.log("测试用.onresize.set");
+      // 测试环境不转发事件处理器赋值
     },
     get() {
-      console.log("测试用.onresize.get");
       return null;
     },
   });
@@ -143,10 +220,9 @@ if (!("onblur" in global)) {
     configurable: true,
     enumerable: true,
     set(_newVal) {
-      console.log("测试用.onblur.set");
+      // 测试环境不转发事件处理器赋值
     },
     get() {
-      console.log("测试用.onblur.get");
       return null;
     },
   });
@@ -161,10 +237,9 @@ if (!("onblur" in global)) {
     configurable: true,
     enumerable: true,
     set(_newVal) {
-      console.log("测试用.onfocus.set");
+      // 测试环境不转发事件处理器赋值
     },
     get() {
-      console.log("测试用.onfocus.get");
       return null;
     },
   });
@@ -227,3 +302,27 @@ vi.stubGlobal("define", "特殊关键字不能穿透沙盒");
 if (!URL.createObjectURL) URL.createObjectURL = undefined;
 //@ts-expect-error
 if (!URL.revokeObjectURL) URL.revokeObjectURL = undefined;
+
+// ---- Radix UI（DropdownMenu / Select / Sheet 等）在 DOM 测试环境下所需的指针 API 垫片 ----
+// 测试环境可能未实现 PointerEvent，导致 Radix 触发器的 `event.button === 0` 判断失效、菜单无法展开；
+// 同时缺少指针捕获与 scrollIntoView。下面补齐这些浏览器原生 API，仅用于测试环境。
+if (typeof window !== "undefined") {
+  if (typeof (globalThis as any).PointerEvent === "undefined") {
+    class PointerEventPolyfill extends MouseEvent {
+      public pointerId?: number;
+      public pointerType?: string;
+      constructor(type: string, params: PointerEventInit = {}) {
+        super(type, params);
+        this.pointerId = params.pointerId;
+        this.pointerType = params.pointerType;
+      }
+    }
+    vi.stubGlobal("PointerEvent", PointerEventPolyfill);
+  }
+  for (const method of ["hasPointerCapture", "setPointerCapture", "releasePointerCapture", "scrollIntoView"] as const) {
+    if (!(method in Element.prototype)) {
+      // @ts-ignore 测试环境补齐缺失的指针/滚动方法（no-op）
+      Element.prototype[method] = function () {};
+    }
+  }
+}

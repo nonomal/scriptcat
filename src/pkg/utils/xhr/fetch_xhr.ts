@@ -52,7 +52,7 @@ export class FetchXHR {
   private body: BodyInit | null = null;
   private controller: AbortController | null = null;
   private timedOut = false;
-  private timeoutId: number | null = null;
+  private timeoutId: ReturnType<typeof setTimeout> | null = null;
   private _responseHeaders: {
     getAllResponseHeaders: () => string;
     getResponseHeader: (name: string) => string | null;
@@ -68,6 +68,8 @@ export class FetchXHR {
     this.method = method.toUpperCase();
     this.url = url;
     this.readyState = FetchXHR.OPENED;
+    // 对齐 TM 的实现：上层不处理 readyState 从 0 到 1 的 onreadystatechange 事件。
+    // 说明：底层核心实现应尽量保持通用性，避免为 TM 引入特殊处理。
     this._emitReadyStateChange();
   }
 
@@ -90,23 +92,25 @@ export class FetchXHR {
     // Not supported by fetch; no-op to keep parity.
   }
 
-  async send(body?: BodyInit | null) {
+  private readonly fetchSendTimeout = () => {
+    if (this.controller && !this.reqDone) {
+      this.timedOut = true;
+      this.controller.abort();
+    }
+  };
+
+  private readonly sendAsync = async (resolve: (value: void | PromiseLike<void>) => void) => {
     if (this.readyState !== FetchXHR.OPENED || !this.method || !this.url) {
+      resolve();
       throw new Error("Invalid state: call open() first.");
     }
     this.reqDone = false;
 
-    this.body = body ?? null;
     this.controller = new AbortController();
 
     // Setup timeout if specified
     if (this.timeout > 0) {
-      this.timeoutId = setTimeout(() => {
-        if (this.controller && !this.reqDone) {
-          this.timedOut = true;
-          this.controller.abort();
-        }
-      }, this.timeout) as unknown as number;
+      this.timeoutId = setTimeout(this.fetchSendTimeout, this.timeout) as ReturnType<typeof setTimeout>;
     }
 
     try {
@@ -120,6 +124,7 @@ export class FetchXHR {
       this.extraOptsFn?.(opts);
       this.onloadstart?.({ type: "loadstart" });
       const res = await fetch(this.url, opts);
+      resolve();
 
       // Update status + headers
       this.status = res.status;
@@ -129,10 +134,12 @@ export class FetchXHR {
         getAllResponseHeaders(): string {
           let ret: string | undefined = this.cache[""];
           if (ret === undefined) {
+            // 对齐 TM 的实现：由上层负责将 getAllResponseHeaders() 的格式对齐
+            // 说明：底层核心实现应尽量保持通用性，避免针对 TM 引入特殊处理。
             ret = "";
-            res.headers.forEach((v, k) => {
+            for (const [k, v] of res.headers) {
               ret += `${k}: ${v}\r\n`;
-            });
+            }
             this.cache[""] = ret;
           }
           return ret;
@@ -156,7 +163,7 @@ export class FetchXHR {
       this.readyState = FetchXHR.HEADERS_RECEIVED;
       this._emitReadyStateChange();
 
-      let responseOverrided: ReadableStream<Uint8Array> | null = null;
+      let responseOverrided: ReadableStream<Uint8Array<ArrayBufferLike>> | null = null;
 
       // Storage buffers for different responseTypes
       // const chunks: Uint8Array<ArrayBufferLike>[] = [];
@@ -193,21 +200,16 @@ export class FetchXHR {
       }
 
       let customStatus = null;
-      if (res.body === null) {
-        if (res.type === "opaqueredirect") {
-          customStatus = 301;
-        } else {
-          throw new Error("Response Body is null");
-        }
-      } else if (res.body !== null) {
+      const resBody = res.body;
+      if (resBody !== null) {
         // Stream body for progress
         let streamReader;
         let streamReadable;
         if (textDecoderStream) {
-          streamReadable = res.body?.pipeThrough(textDecoderStream);
+          streamReadable = resBody?.pipeThrough(textDecoderStream);
           if (!streamReadable) throw new Error("streamReadable is undefined.");
         } else {
-          streamReader = res.body?.getReader();
+          streamReader = resBody?.getReader();
           if (!streamReader) throw new Error("streamReader is undefined.");
         }
 
@@ -221,6 +223,8 @@ export class FetchXHR {
             didLoaded = true;
             // Move to LOADING state as soon as we start reading
             this.readyState = FetchXHR.LOADING;
+            // 对齐 TM 的实现：上层不处理 readyState 从 2 到 3 的 onreadystatechange 事件。
+            // 说明：底层核心实现应尽量保持通用性，避免为 TM 引入特殊处理。
             this._emitReadyStateChange();
           }
         };
@@ -270,7 +274,7 @@ export class FetchXHR {
               controller.error("XHR failed");
             }
           };
-          responseOverrided = new ReadableStream<Uint8Array>({
+          responseOverrided = new ReadableStream<Uint8Array<ArrayBufferLike>>({
             start(controller) {
               myController = controller;
             },
@@ -297,6 +301,8 @@ export class FetchXHR {
                 if (done) break;
                 pushBuffer(value);
               }
+            } catch (e) {
+              console.error("streamReader error", e);
             } finally {
               streamReader.releaseLock();
             }
@@ -316,6 +322,8 @@ export class FetchXHR {
               }
               pushBuffer(value);
             }
+          } catch (e) {
+            console.error("streamReader error", e);
           } finally {
             streamReader.releaseLock();
           }
@@ -330,6 +338,17 @@ export class FetchXHR {
             pushBuffer(data);
           }
         }
+      } else if (res.type === "opaqueredirect") {
+        customStatus = 301;
+      } else if (
+        this.method.toUpperCase() === "HEAD" ||
+        res.status === 204 ||
+        res.status === 205 ||
+        res.status === 304
+      ) {
+        // No body is expected for these responses.
+      } else {
+        throw new Error("Response Body is null");
       }
 
       this.status = customStatus || res.status;
@@ -346,6 +365,7 @@ export class FetchXHR {
       this._emitReadyStateChange();
       this.onload?.({ type: "load" });
     } catch (err) {
+      resolve();
       this.controller = null;
       if (this.timeoutId != null) {
         clearTimeout(this.timeoutId);
@@ -382,6 +402,14 @@ export class FetchXHR {
       this.reqDone = true;
       this.onloadend?.({ type: "loadend" });
     }
+  };
+
+  send(body?: BodyInit | null) {
+    if (this.body !== null) {
+      throw new Error("Repeated Calls to send()");
+    }
+    this.body = body ?? null;
+    return new Promise<void>(this.sendAsync);
   }
 
   abort() {

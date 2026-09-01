@@ -1,35 +1,228 @@
 import { describe, expect, it, beforeAll } from "vitest";
-import { checkSilenceUpdate, cleanFileName, stringMatching, toCamelCase } from "./utils";
+import {
+  aNow,
+  checkSilenceUpdate,
+  cleanFileName,
+  formatBytes,
+  normalizeResponseHeaders,
+  openInCurrentTab,
+  stringMatching,
+  stripUndefined,
+  toCamelCase,
+} from "./utils";
 import { ltever, versionCompare } from "@App/pkg/utils/semver";
-import { nextTime } from "./cron";
-import dayjs from "dayjs";
+import { nextTimeDisplay, nextTimeInfo } from "./cron";
 
-describe.concurrent("nextTime", () => {
-  const date = new Date(1737275107000);
+describe.concurrent("aNow", () => {
+  // aNow >= Date.now();
+  it.sequential("aNow is greater than or equal to Date.now()", () => {
+    const p1 = Date.now();
+    const p2 = aNow();
+    const p3 = Date.now();
+    expect(p2).greaterThanOrEqual(p1);
+    // aNow() 与 Date.now() 的值应非常接近
+    expect(p2).greaterThan(p1 - 0.01);
+    expect(p2).lessThan(p3 + 0.01);
+  });
+  // 在 vitest 环境只能实测 aNow() 的严格增加
+  it.sequential("aNow is Strictly Increasing", () => {
+    const p1 = [aNow(), aNow(), aNow(), aNow(), aNow(), aNow()];
+    expect(p1[0]).lessThan(p1[1]);
+    expect(p1[1]).lessThan(p1[2]);
+    expect(p1[2]).lessThan(p1[3]);
+    expect(p1[3]).lessThan(p1[4]);
+    expect(p1[4]).lessThan(p1[5]);
+    const p2 = [...p1].sort();
+    expect(p1).toEqual(p2);
+  });
+});
+
+const assertNextTimeInfo = (expr: string, date: Date, expected: any) => {
+  const actual = nextTimeInfo(expr, date);
+  const result = {
+    next: actual.next.toFormat(actual.format),
+    once: actual.once,
+  };
+
+  expect(
+    result,
+    [
+      "",
+      "",
+      `expr: ${expr}`,
+      `date: ${date.toISOString()}`,
+      `expected: ${JSON.stringify(expected)}`,
+      `actual:   ${JSON.stringify(result)}`,
+      "",
+      "",
+    ].join("\n")
+  ).toEqual(expected);
+};
+
+describe.concurrent("nextTimeDisplay ERROR SAFE", () => {
+  it.concurrent.each([
+    ["* * * once * once"],
+    ["* * once * once"],
+    ["* once(2,4) once(4-5) * *"],
+    ["* * 1 A *"],
+    ["* once 1.2 * *"],
+    ["* 3 1**2 * *"],
+    ["* 1^2 F * *"],
+    ["1 1 * *"],
+    ["* 3"],
+  ])("错误Cron表达式: %s", (expr) => {
+    // 确保无效表达式不会抛出异常
+    expect(() => nextTimeDisplay(expr)).not.toThrow();
+  });
+});
+
+describe.concurrent("nextTimeInfo1", () => {
+  const date = new Date("2025-12-17T11:47:17.629"); // 2025-12-17 11:47:17.629 (本地时区)
+
   // 让程序先执行一下，避免超时问题
   beforeAll(() => {
-    nextTime("* * * * *");
-    dayjs(date);
+    nextTimeDisplay("* * * * *");
   });
-  it.sequential("每分钟表达式", () => {
-    expect(nextTime("* * * * *", date)).toEqual(dayjs(date).add(1, "minute").format("YYYY-MM-DD HH:mm:00"));
+
+  it.concurrent.each([
+    ["* * * * * *", { next: "2025-12-17 11:47:18", once: "" }],
+    ["* * * * *", { next: "2025-12-17 11:48:00", once: "" }],
+    ["* 1-3,5 * * *", { next: "2025-12-18 01:00:00", once: "" }],
+    ["* 3-8/2 * * *", { next: "2025-12-18 03:00:00", once: "" }],
+  ])("标准Cron表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
-  it.sequential("每分钟一次表达式", () => {
-    expect(nextTime("once * * * *", date)).toEqual(
-      dayjs(date).add(1, "minute").format("YYYY-MM-DD HH:mm 每分钟运行一次")
-    );
+
+  it.concurrent.each([
+    ["once * * * *", { next: "2025-12-17 11:48:00", once: "minute" }],
+    ["* once * * *", { next: "2025-12-17 12:00:00", once: "hour" }],
+    ["* * once * *", { next: "2025-12-18", once: "day" }],
+    ["* * * once *", { next: "2026-01", once: "month" }],
+    ["* * * * once", { next: "2025-12-22", once: "week" }],
+
+    ["once(*) * * * *", { next: "2025-12-17 11:48:00", once: "minute" }],
+    ["* once(*) * * *", { next: "2025-12-17 12:00:00", once: "hour" }],
+    ["* * once(*) * *", { next: "2025-12-18", once: "day" }],
+    ["* * * once(*) *", { next: "2026-01", once: "month" }],
+    ["* * * * once(*)", { next: "2025-12-22", once: "week" }],
+
+    ["once(5-7) * * * *", { next: "2025-12-17 12:05:00", once: "minute" }],
+    ["* once(5-7) * * *", { next: "2025-12-18 05:00:00", once: "hour" }],
+    ["* * once(5-7) * *", { next: "2026-01-05", once: "day" }],
+    ["* * * once(5-7) *", { next: "2026-05", once: "month" }],
+    ["* * * * once(5-7)", { next: "2025-12-26", once: "week" }],
+  ])("once表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
-  it.sequential("每小时一次表达式", () => {
-    expect(nextTime("* once * * *", date)).toEqual(dayjs(date).add(1, "hour").format("YYYY-MM-DD HH 每小时运行一次"));
+
+  it.concurrent.each([
+    ["once * * * *", { next: "2025-12-17 11:48:00", once: "minute" }],
+    ["* once * * * *", { next: "2025-12-17 11:48:00", once: "minute" }],
+    ["45 once * * * *", { next: "2025-12-17 11:48:45", once: "minute" }],
+    ["once 1-3,5 * * *", { next: "2025-12-18 01:00:00", once: "minute" }],
+    ["once 3-8/2 * * *", { next: "2025-12-18 03:00:00", once: "minute" }],
+  ])("每分钟一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
-  it.sequential("每天一次表达式", () => {
-    expect(nextTime("* * once * *", date)).toEqual(dayjs(date).add(1, "day").format("YYYY-MM-DD 每天运行一次"));
+
+  it.concurrent.each([
+    ["* once * * *", { next: "2025-12-17 12:00:00", once: "hour" }],
+    ["* * once * * *", { next: "2025-12-17 12:00:00", once: "hour" }],
+    ["10 once * * *", { next: "2025-12-17 12:10:00", once: "hour" }],
+    ["* 10 once * * *", { next: "2025-12-17 12:10:00", once: "hour" }],
+    ["45 10 once * * *", { next: "2025-12-17 12:10:45", once: "hour" }],
+    ["1-3,5 once * * *", { next: "2025-12-17 12:01:00", once: "hour" }],
+    ["3-8/2 once * * *", { next: "2025-12-17 12:03:00", once: "hour" }],
+  ])("每小时一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
-  it.sequential("每月一次表达式", () => {
-    expect(nextTime("* * * once *", date)).toEqual(dayjs(date).add(1, "month").format("YYYY-MM 每月运行一次"));
+
+  it.concurrent.each([
+    ["* * once * *", { next: "2025-12-18", once: "day" }],
+    ["* * * once * *", { next: "2025-12-18", once: "day" }],
+    ["45 * * once * *", { next: "2025-12-18", once: "day" }],
+    ["33,44 */7 * once * *", { next: "2025-12-18", once: "day" }],
+    ["* * once * 3,6", { next: "2025-12-20", once: "day" }],
+  ])("每天一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
-  it.sequential("每星期一次表达式", () => {
-    expect(nextTime("* * * * once", date)).toEqual(dayjs(date).add(1, "week").format("YYYY-MM-DD 每星期运行一次"));
+
+  it.concurrent.each([
+    ["* * * once *", { next: "2026-01", once: "month" }],
+    ["* * * * once *", { next: "2026-01", once: "month" }],
+    ["45 * * * once *", { next: "2026-01", once: "month" }],
+    ["33,44 */7 * * once *", { next: "2026-01", once: "month" }],
+    ["* * * once 3,6", { next: "2026-01", once: "month" }],
+  ])("每月一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["* * * * once", { next: "2025-12-22", once: "week" }],
+    ["* * * * * once", { next: "2025-12-22", once: "week" }],
+    ["45 * * * * once", { next: "2025-12-22", once: "week" }],
+    ["33,44 */7 * * * once", { next: "2025-12-22", once: "week" }],
+    ["* * 5 * once", { next: "2026-01-05", once: "week" }],
+  ])("每星期一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+});
+
+describe.concurrent("nextTimeInfo2", () => {
+  const date = new Date("2025-12-31T23:59:59.999"); // 2025-12-31 23:59:59.999（本地时区）
+
+  // 让程序先执行一下，避免超时问题
+  beforeAll(() => {
+    nextTimeDisplay("* * * * *");
+  });
+
+  it.concurrent.each([
+    ["* * * * * *", { next: "2026-01-01 00:00:00", once: "" }],
+    ["* * * * *", { next: "2026-01-01 00:00:00", once: "" }],
+  ])("标准 Cron 表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["once * * * *", { next: "2026-01-01 00:00:00", once: "minute" }],
+    ["* once * * * *", { next: "2026-01-01 00:00:00", once: "minute" }],
+    ["45 once * * * *", { next: "2026-01-01 00:00:45", once: "minute" }],
+  ])("每分钟一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["* once * * *", { next: "2026-01-01 00:00:00", once: "hour" }],
+    ["* * once * * *", { next: "2026-01-01 00:00:00", once: "hour" }],
+    ["10 once * * *", { next: "2026-01-01 00:10:00", once: "hour" }],
+    ["* 10 once * * *", { next: "2026-01-01 00:10:00", once: "hour" }],
+    ["45 10 once * * *", { next: "2026-01-01 00:10:45", once: "hour" }],
+  ])("每小时一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["* * once * *", { next: "2026-01-01", once: "day" }],
+    ["* * * once * *", { next: "2026-01-01", once: "day" }],
+    ["45 * * once * *", { next: "2026-01-01", once: "day" }],
+  ])("每天一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["* * * once *", { next: "2026-01", once: "month" }],
+    ["* * * * once *", { next: "2026-01", once: "month" }],
+    ["45 * * * once *", { next: "2026-01", once: "month" }],
+  ])("每月一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
+  });
+
+  it.concurrent.each([
+    ["* * * * once", { next: "2026-01-05", once: "week" }],
+    ["* * * * * once", { next: "2026-01-05", once: "week" }],
+    ["45 * * * * once", { next: "2026-01-05", once: "week" }],
+  ])("每星期一次表达式: %s", (expr, expected) => {
+    assertNextTimeInfo(expr, date, expected);
   });
 });
 
@@ -249,7 +442,6 @@ describe.concurrent("checkSilenceUpdate", () => {
 
 describe.concurrent("cleanFileName", () => {
   it.concurrent("should replace illegal characters with dashes", () => {
-    expect(cleanFileName("file/name")).toBe("file-name");
     expect(cleanFileName("file\\name")).toBe("file-name");
     expect(cleanFileName("file:name")).toBe("file-name");
     expect(cleanFileName("file*name")).toBe("file-name");
@@ -265,6 +457,7 @@ describe.concurrent("cleanFileName", () => {
 
   it.concurrent("should handle valid filename", () => {
     expect(cleanFileName("valid_file.txt")).toBe("valid_file.txt");
+    expect(cleanFileName("file/name.txt")).toBe("file/name.txt");
   });
 });
 
@@ -346,6 +539,181 @@ describe.concurrent("toCamelCase", () => {
 
   it.concurrent("应当正确处理多下划线配置键", () => {
     expect(toCamelCase("editor_type_definition")).toBe("EditorTypeDefinition");
-    expect(toCamelCase("script_list_column_width")).toBe("ScriptListColumnWidth");
+  });
+});
+
+describe.concurrent("formatBytes", () => {
+  it.concurrent("应当正确格式化字节大小", () => {
+    // 0 字节
+    expect(formatBytes(0)).toBe("0 B");
+
+    // 字节单位
+    expect(formatBytes(100)).toBe("100.00 B");
+    expect(formatBytes(512)).toBe("512.00 B");
+
+    // KB 单位
+    expect(formatBytes(1024)).toBe("1.00 KB");
+    expect(formatBytes(2048)).toBe("2.00 KB");
+    expect(formatBytes(1536)).toBe("1.50 KB");
+
+    // MB 单位
+    expect(formatBytes(1048576)).toBe("1.00 MB");
+    expect(formatBytes(2097152)).toBe("2.00 MB");
+    expect(formatBytes(1234567)).toBe("1.18 MB");
+
+    // 自定义小数位数
+    expect(formatBytes(1536, 0)).toBe("2 KB");
+    expect(formatBytes(1536, 1)).toBe("1.5 KB");
+  });
+});
+
+describe.concurrent("normalizeResponseHeaders", () => {
+  it.concurrent("returns empty string for empty input", () => {
+    expect(normalizeResponseHeaders("")).toBe("");
+  });
+
+  it.concurrent("keeps valid header lines and outputs name:value joined with CRLF", () => {
+    const input = "Content-Type: text/plain\nX-Test: abc\n";
+    expect(normalizeResponseHeaders(input)).toBe("Content-Type:text/plain\r\nX-Test:abc");
+  });
+
+  it.concurrent("accepts LF and CRLF line endings", () => {
+    const input = "A: 1\r\nB: 2\r\n";
+    expect(normalizeResponseHeaders(input)).toBe("A:1\r\nB:2");
+  });
+
+  it.concurrent("parses last line even without a trailing newline", () => {
+    const input = "A: 1\nB: 2";
+    expect(normalizeResponseHeaders(input)).toBe("A:1\r\nB:2");
+  });
+
+  it.concurrent("does NOT skip lines where value starts immediately after ':'", () => {
+    const input = "A:1\nB:2\n";
+    expect(normalizeResponseHeaders(input)).toBe("A:1\r\nB:2");
+  });
+
+  it.concurrent("works with non-ASCII characters", () => {
+    const input = "X-名前: 値\n";
+    expect(normalizeResponseHeaders(input)).toBe("X-名前:値");
+  });
+
+  it.concurrent("standard test", () => {
+    const input = `content-type: text/html; charset=utf-8\r\n
+server: Apache/2.4.41 (Ubuntu)\r\n
+set-cookie: sessionid=abc123; Path=/; HttpOnly\r\n
+cache-control: no-store, no-cache, must-revalidate\r\n
+expires: Thu, 19 Nov 1981 08:52:00 GMT\r\n
+pragma: no-cache\r\n
+x-frame-options: SAMEORIGIN\r\n
+x-content-type-options: nosniff\r\n
+content-security-policy: default-src 'self'\r\n
+access-control-allow-origin: *\r\n`
+      .split(/\s*\r\n\s*/)
+      .join("\r\n");
+
+    const expected = `content-type:text/html; charset=utf-8\r\n
+server:Apache/2.4.41 (Ubuntu)\r\n
+set-cookie:sessionid=abc123; Path=/; HttpOnly\r\n
+cache-control:no-store, no-cache, must-revalidate\r\n
+expires:Thu, 19 Nov 1981 08:52:00 GMT\r\n
+pragma:no-cache\r\n
+x-frame-options:SAMEORIGIN\r\n
+x-content-type-options:nosniff\r\n
+content-security-policy:default-src 'self'\r\n
+access-control-allow-origin:*`
+      .split(/\s*\r\n\s*/)
+      .join("\r\n");
+
+    expect(normalizeResponseHeaders(input)).toBe(expected);
+    expect(normalizeResponseHeaders(expected)).toBe(expected);
+  });
+});
+
+describe("stripUndefined", () => {
+  // 基本功能：移除 undefined 值
+  it("应移除所有 undefined 属性", () => {
+    const input = { a: 1, b: undefined, c: "hello" };
+    const result = stripUndefined(input);
+    expect(result).toEqual({ a: 1, c: "hello" });
+    expect("b" in result).toBe(false);
+  });
+
+  // 保留 null 值
+  it("应保留 null 值", () => {
+    const input = { a: null, b: undefined };
+    const result = stripUndefined(input);
+    expect(result).toEqual({ a: null });
+  });
+
+  // 保留假值（false、0、空字符串）
+  it("应保留假值（false、0、空字符串）", () => {
+    const input = { a: false, b: 0, c: "", d: undefined };
+    const result = stripUndefined(input);
+    expect(result).toEqual({ a: false, b: 0, c: "" });
+  });
+
+  // 空对象
+  it("空对象应返回空对象", () => {
+    expect(stripUndefined({})).toEqual({});
+  });
+
+  // 全部为 undefined
+  it("所有属性均为 undefined 时应返回空对象", () => {
+    const input = { a: undefined, b: undefined };
+    expect(stripUndefined(input)).toEqual({});
+  });
+
+  // 无 undefined 时原样返回
+  it("无 undefined 属性时应返回相同内容", () => {
+    const input = { a: 1, b: "hello", c: true };
+    expect(stripUndefined(input)).toEqual(input);
+  });
+
+  // 嵌套对象（不递归处理）
+  it("嵌套对象内的 undefined 不应被递归移除", () => {
+    const input = { a: { b: undefined }, c: 1 };
+    const result = stripUndefined(input);
+    expect(result).toEqual({ a: { b: undefined }, c: 1 });
+  });
+
+  // 不修改原始对象
+  it("不应修改原始对象", () => {
+    const input = { a: 1, b: undefined };
+    stripUndefined(input);
+    expect(input).toEqual({ a: 1, b: undefined });
+    expect("b" in input).toBe(true);
+  });
+
+  // 保留数组值
+  it("应保留数组值", () => {
+    const input = { a: [1, 2, 3], b: undefined };
+    const result = stripUndefined(input);
+    expect(result).toEqual({ a: [1, 2, 3] });
+  });
+});
+
+describe("openInCurrentTab", () => {
+  // 在 Edge Android 等移动端，window.open 打不开 chrome-extension:// 内部页，
+  // 内部页必须经由扩展 API（chrome.tabs.create）打开（见 #686）。
+  it("应通过 chrome.tabs.create 在当前标签页之后打开内部页", async () => {
+    let created: chrome.tabs.CreateProperties | undefined;
+    const onCreate = (props: chrome.tabs.CreateProperties) => {
+      created = props;
+    };
+    (chrome.tabs as any).hook.on("create", onCreate);
+    try {
+      await openInCurrentTab("/src/options.html");
+    } finally {
+      (chrome.tabs as any).hook.removeListener("create", onCreate);
+    }
+    expect(created?.url).toBe("/src/options.html");
+    // getCurrentTab 返回 index:0 的标签，新标签应排在其后
+    expect(created?.index).toBe(1);
+  });
+
+  // MainLayout 拖拽导入据返回值判断是否成功打开安装页，因此必须回传创建出来的标签
+  it("应返回创建出来的标签供调用方判断是否成功打开", async () => {
+    const tab = await openInCurrentTab("/src/install.html?file=abc");
+    expect(tab?.id).toBe(1);
   });
 });

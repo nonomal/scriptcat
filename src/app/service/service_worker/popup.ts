@@ -1,11 +1,16 @@
 import { type IMessageQueue } from "@Packages/message/message_queue";
 import { type Group } from "@Packages/message/server";
 import { type RuntimeService } from "./runtime";
-import type { ScriptMenu, TPopupScript } from "./types";
+import type { ScriptMenu, TPopupPageStatus, TPopupScript } from "./types";
 import type { GetPopupDataReq, GetPopupDataRes, MenuClickParams } from "./client";
 import { cacheInstance } from "@App/app/cache";
 import type { ScriptDAO } from "@App/app/repo/scripts";
-import { scriptToMenu, type TPopupPageLoadInfo } from "./popup_scriptmenu";
+import {
+  applyScriptDisplayInfo,
+  scriptToMenu,
+  type TPopupPageLoadInfo,
+  type TPopupPageRestoreInfo,
+} from "./popup_scriptmenu";
 import { SCRIPT_STATUS_ENABLE, SCRIPT_TYPE_NORMAL, SCRIPT_RUN_STATUS_RUNNING } from "@App/app/repo/scripts";
 import type {
   TDeleteScript,
@@ -16,11 +21,13 @@ import type {
   TScriptRunStatus,
 } from "../queue";
 import { getCurrentTab } from "@App/pkg/utils/utils";
-import type { SystemConfig } from "@App/pkg/config/config";
-import { CACHE_KEY_TAB_SCRIPT } from "@App/app/cache_key";
+import { type SystemConfig } from "@App/pkg/config/config";
+import { CACHE_KEY_TAB_LOADED, CACHE_KEY_TAB_SCRIPT } from "@App/app/cache_key";
 import { timeoutExecution } from "@App/pkg/utils/timer";
 import { v5 as uuidv5 } from "uuid";
-import { getCombinedMeta } from "./utils";
+import { getPageAccessKind, isExtensionStoreUrl, toOrigin } from "@App/pkg/utils/page_access";
+import LoggerCore from "@App/app/logger/core";
+import Logger from "@App/app/logger/logger";
 
 const enum ScriptMenuRegisterType {
   REGISTER = 1,
@@ -101,6 +108,7 @@ export class PopupService {
   // 将 ScriptMenu[] 转为 Chrome contextMenus.CreateProperties[]；同一 groupKey 仅保留一个实际显示项。
   genScriptMenuByTabMap(menuEntries: chrome.contextMenus.CreateProperties[], menu: ScriptMenu[]) {
     for (const { uuid, name, menus } of menu) {
+      let needsParentMenu = false;
       const subMenuEntries = [] as chrome.contextMenus.CreateProperties[];
       let withMenuItem = false;
       const groupKeys = new Map<string, { name: string; mSeparator?: boolean; nested?: boolean }>();
@@ -129,6 +137,7 @@ export class PopupService {
         }
         if (nested) {
           createProperties.parentId = `scriptMenu_${uuid}`; // 上层是 `scriptMenu_${uuid}`
+          needsParentMenu = true;
         } else {
           createProperties.parentId = `scriptMenu`;
         }
@@ -136,15 +145,15 @@ export class PopupService {
       }
       if (withMenuItem) {
         // 创建脚本菜单
-        menuEntries.push(
-          {
+        if (needsParentMenu) {
+          menuEntries.push({
             id: `scriptMenu_${uuid}`,
             title: name,
             contexts: ["all"],
             parentId: "scriptMenu",
-          },
-          ...subMenuEntries
-        );
+          });
+        }
+        menuEntries.push(...subMenuEntries);
       }
     }
   }
@@ -290,8 +299,34 @@ export class PopupService {
     list.push({ ...message, registerType });
     let retUpdated: string[] | undefined;
     return Promise.resolve(list) // 增加一个 await Promise.reslove() 转移微任务队列 再判断长度是否为0
-      .then((list) => {
+      .then(async (list) => {
         if (!list.length) return;
+
+        // 内容脚本可能在其脚本被删除后，仍迟到地发来 GM_registerMenuCommand。
+        // 必须先丢弃这些已删脚本的注册记录，避免它们重新生成残留的 tabScript:<tabId> Popup 菜单项。
+        const registerUuids = [
+          ...new Set(
+            list.filter((entry) => entry.registerType === ScriptMenuRegisterType.REGISTER).map((entry) => entry.uuid)
+          ),
+        ];
+        if (registerUuids.length) {
+          // gets() 返回结果与入参下标一一对应，不存在的脚本为 undefined，由此得出「仍存在」的 uuid 集合。
+          const scripts = await this.scriptDAO.gets(registerUuids);
+          const existingUuids = new Set();
+          for (const s of scripts) if (s) existingUuids.add(s.uuid);
+          // 倒序遍历删除，避免 splice 改变后续元素下标。
+          for (let idx = list.length - 1; idx >= 0; idx--) {
+            const entry = list[idx];
+            if (entry.registerType === ScriptMenuRegisterType.REGISTER && !existingUuids.has(entry.uuid)) {
+              list.splice(idx, 1);
+            }
+          }
+          if (!list.length) {
+            this.updateMenuCommands.delete(tabId);
+            return;
+          }
+        }
+
         return cacheInstance.tx(`${CACHE_KEY_TAB_SCRIPT}${tabId}`, (data: ScriptMenu[] | undefined, tx) => {
           if (!list.length) return;
           data = data || [];
@@ -340,8 +375,20 @@ export class PopupService {
   // 获取popup页面数据
   async getPopupData(req: GetPopupDataReq): Promise<GetPopupDataRes> {
     const { url, tabId } = req;
+    const pageStatus = await this.getPageStatus(tabId, url);
+    if (pageStatus === "restricted") {
+      // 浏览器保留页与自家扩展商店上脚本猫永远触及不到，列出「匹配到的」脚本只会让人以为
+      // 它们在跑（#1687）。其余状态的抑制原因都可以解除——开开关、开开发者模式、移出黑名单、
+      // 给文件访问权限、刷新页面——照常列出匹配脚本，用户才知道解除后哪些会生效；顶部提示
+      // 已经说明了它们现在为什么没跑。后台脚本与当前页无关，照常返回。
+      return {
+        pageStatus,
+        scriptList: [],
+        backScriptList: await this.attachScriptDisplayInfo(await this.getScriptMenu(-1)),
+      };
+    }
     const [matchingResult, runScripts, backScriptList] = await Promise.all([
-      this.runtime.getPageScriptMatchingResultByUrl(url, true, true),
+      this.runtime.getPopupPageScriptMatchingResultByUrl(url),
       this.getScriptMenu(tabId),
       this.getScriptMenu(-1),
     ]);
@@ -368,35 +415,205 @@ export class PopupService {
         // 如果脚本已经存在，则不添加，更新信息
         run.enable = script.status === SCRIPT_STATUS_ENABLE;
         run.isEffective = o.effective!;
+        run.hasMatchOverride = script.selfMetadata?.match !== undefined;
         run.hasUserConfig = !!script.config;
       } else {
-        if (script.selfMetadata) {
-          script.metadata = getCombinedMeta(script.metadata, script.selfMetadata);
-        }
+        // 由于目前没有在 Popup 显示 @match @include @exclude, 所以以下代码暂不需要
+        // if (script.selfMetadata) {
+        //   script.metadata = getCombinedMeta(script.metadata, script.selfMetadata);
+        // }
         run = scriptToMenu(script);
         run.isEffective = o.effective!;
       }
+      run.matchesTopFrame = true;
       scriptMenuMap.set(uuid, run);
     }
 
-    // 将未匹配当前 url 但仍在运行的脚本，附加到清单末端，避免使用者找不到其菜单。
-    // 把运行了但是不在匹配中的脚本加入到菜单的最后 （因此 runMap 和 scriptMenuMap 分开成两个变数）
-    for (const script of runScripts) {
-      // 把运行了但是不在匹配中的脚本加入菜单
-      if (!scriptMenuMap.has(script.uuid)) {
-        scriptMenuMap.set(script.uuid, script);
+    await this.mergeSubFrameRunScripts(tabId, url, runScripts, scriptMenuMap);
+
+    const scriptMenu = [...scriptMenuMap.values()];
+    // 即时附加图标与本地化脚本名（仅写入响应，不回写 session 缓存，避免 icon64 等占用过大）
+    const [scriptListWithInfo, backScriptListWithInfo] = await Promise.all([
+      this.attachScriptDisplayInfo(scriptMenu),
+      this.attachScriptDisplayInfo(backScriptList),
+    ]);
+    // 后台脚本只显示开启或者运行中的脚本
+    return { pageStatus, scriptList: scriptListWithInfo, backScriptList: backScriptListWithInfo };
+  }
+
+  /**
+   * 判断当前页脚本猫是否触及得到。
+   *
+   * 顺序有意为之：浏览器保留页与黑名单是「无论如何都不会注入」的确定结论，先判；
+   * 接着是扩展整体没跑起来的两种情况（全局开关关闭、UserScripts API 不可用），它们与具体
+   * 标签页无关，必须先于注入证据 —— 注入证据只是「本 tab 曾经报到过」，页面刷新与关开关都
+   * 不会让它失效，用它去否定全局状态会使同一开关状态下老标签页没提示、新标签页有提示。
+   * 其余情况以「本 tab 有没有 content script 报到」为准 —— 它是运行时证据，
+   * 比协议白名单准（企业策略、扩展商店等都拦不住白名单）。file:// 的权限查询只用来
+   * 给未注入的情况一个更准确的原因，不能反过来否定已经注入成功的事实（Firefox 上该
+   * 查询与实际可注入性并不总是一致）。
+   */
+  private async getPageStatus(tabId: number, url: string): Promise<TPopupPageStatus> {
+    const kind = getPageAccessKind(url);
+    if (kind === "restricted") return "restricted";
+    if (this.runtime.isUrlBlacklist(url)) return "blacklist";
+    // 脚本功能整体没开时 content script 根本没注册（registerUserscripts 直接 return），
+    // 此时说「刷新页面后生效」是错的——刷新永远不会生效，得先开开关/开发者模式。
+    if (!this.runtime.isUserScriptsAvailable) return "userscripts-unavailable";
+    if (!this.runtime.isLoadScripts) return "scripts-disabled";
+    if (await this.isTabInjected(tabId, url)) return "ok";
+    // 以下都是「确认没注入」，只为给出更准确的原因。
+    // 两项判据都与浏览器有关（Edge 商店在 Chrome 里是普通网页；Firefox 的文件访问开关语义也不同），
+    // 放在注入证据之后才不会误伤实际能运行的页面。
+    if (isExtensionStoreUrl(url)) return "restricted";
+    if (kind === "file" && !(await chrome.extension.isAllowedFileSchemeAccess())) return "file-access-denied";
+    return "not-injected";
+  }
+
+  /** 本 tab 是否收到过当前 origin 的 content script 报到。 */
+  private async isTabInjected(tabId: number, url: string) {
+    const origin = await cacheInstance.get<string>(`${CACHE_KEY_TAB_LOADED}${tabId}`);
+    return !!origin && origin === toOrigin(url);
+  }
+
+  /**
+   * 把「只在子 frame（iframe）里跑起来」的脚本并回当前页清单。
+   *
+   * 清单主体按顶层网址匹配，因此 @match 只命中 iframe 的脚本连同它在 iframe 注册的 GM 菜单
+   * 都会整条消失（#1687）。判定条件是「本 tab 跑过 ∧ 现在仍匹配某个子 frame」而非单纯「跑过」：
+   * 用户在 Popup 排除本站后脚本对所有 frame 都不再匹配，该行仍会立即消失。
+   */
+  private async mergeSubFrameRunScripts(
+    tabId: number,
+    topUrl: string,
+    runScripts: ScriptMenu[],
+    scriptMenuMap: Map<string, ScriptMenu>
+  ) {
+    const unmatched = runScripts.filter((script) => !scriptMenuMap.has(script.uuid));
+    if (!unmatched.length) return;
+
+    const frameUrls = await this.getSubFrameUrls(tabId, topUrl);
+    if (!frameUrls.length) return;
+
+    // effective 取「任一 frame 生效」：脚本只要在某个 frame 上没有被排除，它就确实会在该页运行。
+    const frameMatching = new Map<string, boolean>();
+    for (const frameUrl of frameUrls) {
+      const matchingResult = await this.runtime.getPopupPageScriptMatchingResultByUrl(frameUrl);
+      for (const [uuid, o] of matchingResult) {
+        frameMatching.set(uuid, frameMatching.get(uuid) || o.effective);
       }
     }
-    const scriptMenu = [...scriptMenuMap.values()];
-    // 检查是否在黑名单中
-    const isBlacklist = this.runtime.isUrlBlacklist(url);
-    // 后台脚本只显示开启或者运行中的脚本
-    return { isBlacklist, scriptList: scriptMenu, backScriptList };
+
+    const matchedRunScripts = unmatched.filter((script) => frameMatching.has(script.uuid));
+    if (!matchedRunScripts.length) return;
+
+    // 运行记录来自 tabScript:<tabId> session cache，脚本删除事件与 Popup 读取可能交错，
+    // 因此要用 DAO 结果做读侧防护，避免已删除脚本残留在 Popup 清单。
+    const scripts = await this.scriptDAO.gets(matchedRunScripts.map((script) => script.uuid));
+    for (let idx = 0, l = matchedRunScripts.length; idx < l; idx++) {
+      const script = scripts[idx];
+      if (!script) continue;
+      const run = matchedRunScripts[idx];
+      run.enable = script.status === SCRIPT_STATUS_ENABLE;
+      run.isEffective = frameMatching.get(run.uuid)!;
+      run.hasMatchOverride = script.selfMetadata?.match !== undefined;
+      run.hasUserConfig = !!script.config;
+      run.matchesTopFrame = false;
+      scriptMenuMap.set(run.uuid, run);
+    }
+  }
+
+  /** 取本 tab 全部子 frame 的网址（去重、排除顶层网址）。标签页已关闭或不可访问时返回空数组。 */
+  private async getSubFrameUrls(tabId: number, topUrl: string): Promise<string[]> {
+    let frames: chrome.webNavigation.GetAllFrameResultDetails[] | null;
+    try {
+      frames = await chrome.webNavigation.getAllFrames({ tabId });
+    } catch (e) {
+      // 取不到框架资料时退化为「只看顶层匹配」，与本功能加入前的行为一致。
+      LoggerCore.logger().warn("getAllFrames failed", { tabId }, Logger.E(e));
+      return [];
+    }
+    const urls = new Set<string>();
+    for (const frame of frames || []) {
+      if (!frame.frameId || !frame.url || frame.url === topUrl) continue;
+      urls.add(frame.url);
+    }
+    return [...urls];
+  }
+
+  /** 为 ScriptMenu 列表即时附加图标 URL 与本地化脚本名（返回浅拷贝，不修改缓存中的原对象） */
+  private async attachScriptDisplayInfo(list: ScriptMenu[]): Promise<ScriptMenu[]> {
+    if (!list.length) return list;
+    const scripts = await this.scriptDAO.gets(list.map((s) => s.uuid));
+    return list.map((s, i) => (scripts[i] ? applyScriptDisplayInfo(s, scripts[i]!) : s));
   }
 
   async getScriptMenu(tabId: number): Promise<ScriptMenu[]> {
     const cacheKey = `${CACHE_KEY_TAB_SCRIPT}${tabId}`;
     return (await cacheInstance.get<ScriptMenu[]>(cacheKey)) || [];
+  }
+
+  // 菜单变化后同步角标计数缓存（脚本数、运行数）。计数为 0 时存空字符串表示不显示角标。
+  // tabId <= 0 为后台菜单(-1)等非真实标签页，跳过。
+  private updateCachedScriptMenuCounters(tabId: number, menu: ScriptMenu[]) {
+    if (tabId <= 0) return;
+    scriptCountMap.set(tabId, menu.length ? `${menu.length}` : "");
+    const runCount = menu.reduce((count, script) => count + (script.runNum || 0), 0);
+    runCountMap.set(tabId, runCount ? `${runCount}` : "");
+  }
+
+  // 把待处理菜单命令队列里属于已删除脚本的项一并清掉，防止它们之后被处理而再次产生残留。
+  private removeDeletedScriptsFromPendingMenuCommands(deletedUuids: Set<string>) {
+    for (const [tabId, commands] of this.updateMenuCommands) {
+      const nextCommands = commands.filter((command) => !deletedUuids.has(command.uuid));
+      if (nextCommands.length) {
+        if (nextCommands.length !== commands.length) {
+          this.updateMenuCommands.set(tabId, nextCommands);
+        }
+      } else {
+        this.updateMenuCommands.delete(tabId);
+      }
+    }
+  }
+
+  // 删除脚本时，扫描「所有」tabScript:<tabId> 缓存清除已删脚本，并同步角标计数。
+  // 旧实现只清理了后台菜单(-1)，导致各标签页缓存残留——这是「删除脚本后 Popup 残留」的根因。
+  private async removeDeletedScriptsFromPopupCaches(uuids: string[]) {
+    if (!uuids.length) return false;
+
+    const deletedUuids = new Set(uuids);
+    this.removeDeletedScriptsFromPendingMenuCommands(deletedUuids);
+
+    const keys = (await cacheInstance.list()).filter((key) => key.startsWith(CACHE_KEY_TAB_SCRIPT));
+    let changed = false;
+    await Promise.all(
+      keys.map((key) =>
+        cacheInstance.tx(key, (menu: ScriptMenu[] | undefined, tx) => {
+          if (!menu?.length) return;
+          const nextMenu = menu.filter((item) => !deletedUuids.has(item.uuid));
+          if (nextMenu.length === menu.length) return;
+
+          changed = true;
+          const tabId = Number(key.slice(CACHE_KEY_TAB_SCRIPT.length));
+          this.updateCachedScriptMenuCounters(tabId, nextMenu);
+          if (nextMenu.length) {
+            tx.set(nextMenu);
+          } else {
+            tx.del();
+          }
+        })
+      )
+    );
+    return changed;
+  }
+
+  // 顶层 frame 报到即说明本页扩展触及得到，来源有二：页面载入（popupPageLoadUpdate）
+  // 与 bfcache 还原（popupPageRestored）。记 origin 而非完整网址，SPA 换页不会失效，
+  // 跳到另一个 origin 则自然失效。
+  async markTabInjected({ tabId, frameId, url }: TPopupPageRestoreInfo) {
+    if (frameId || tabId <= 0) return;
+    const origin = toOrigin(url);
+    if (origin) await cacheInstance.set(`${CACHE_KEY_TAB_LOADED}${tabId}`, origin);
   }
 
   async addScriptRunNumber(o: TPopupPageLoadInfo) {
@@ -502,17 +719,12 @@ export class PopupService {
         }
       });
     });
-    this.mq.subscribe<TDeleteScript[]>("deleteScripts", (data) => {
-      cacheInstance.tx(`${CACHE_KEY_TAB_SCRIPT}${-1}`, (menu: ScriptMenu[] | undefined, tx) => {
-        if (!menu) return;
-        for (const { uuid } of data) {
-          const index = menu.findIndex((item) => item.uuid === uuid);
-          if (index !== -1) {
-            menu.splice(index, 1);
-            tx.set(menu);
-          }
-        }
-      });
+    this.mq.subscribe<TDeleteScript[]>("trashScripts", async (data) => {
+      const changed = await this.removeDeletedScriptsFromPopupCaches(data.map(({ uuid }) => uuid));
+      if (changed) {
+        this.updateBadgeIcon();
+        this.genScriptMenu();
+      }
     });
     this.mq.subscribe<TScriptRunStatus>("scriptRunStatus", ({ uuid, runStatus }) => {
       cacheInstance.tx(`${CACHE_KEY_TAB_SCRIPT}${-1}`, (menu: ScriptMenu[] | undefined, tx) => {
@@ -604,6 +816,7 @@ export class PopupService {
     const clearData = async (tabId: number) => {
       runCountMap.delete(tabId);
       scriptCountMap.delete(tabId);
+      cacheInstance.del(`${CACHE_KEY_TAB_LOADED}${tabId}`);
       const list = this.updateMenuCommands.get(tabId);
       if (list) {
         // 避免 menuCommand 更新在 Tab 移除后触发
@@ -724,7 +937,11 @@ export class PopupService {
 
     // 监听运行次数
     // 监听页面载入事件以更新脚本执行计数；若为当前活动 tab，同步刷新 badge。
+    // bfcache 还原不会重新注入 content script，因此不会再有 popupPageLoadUpdate，
+    // 但页面里的脚本连同它注册的菜单都还活着。少了这条，后退回上一页就会被误判成「没在运行」。
+    this.mq.subscribe<TPopupPageRestoreInfo>("popupPageRestored", this.markTabInjected.bind(this));
     this.mq.subscribe<TPopupPageLoadInfo>("popupPageLoadUpdate", async (o) => {
+      await this.markTabInjected(o);
       await this.addScriptRunNumber(o);
       // 设置角标 (chrome.tabs.onActivated 切换后)
       if (o.tabId === lastActiveTabId) {

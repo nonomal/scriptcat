@@ -38,19 +38,27 @@ export class SWRequestResultParams {
 
   get responseHeaders() {
     const responsed = headersReceivedMap.get(this.markerID);
-    if (responsed && responsed.responseHeaders) {
-      let s = "";
-      for (const h of responsed.responseHeaders) {
-        s += `${h.name}: ${h.value}\n`;
+    const responseHeaders = responsed?.responseHeaders;
+    if (responseHeaders) {
+      let out = "";
+      let separator = "";
+      for (const h of responseHeaders) {
+        // TM兼容: 使用 \r\n 及不包含空白
+        out += `${separator}${h.name}:${h.value}`;
+        separator = "\r\n";
       }
-      this.resultParamResponseHeader = s;
+      this.resultParamResponseHeader = out;
       responsed.responseHeaders = null; // 设为 null 避免重复处理
     }
     return this.resultParamResponseHeader;
   }
 
   get finalUrl() {
-    this.resultParamFinalUrl = redirectedUrls.get(this.markerID) || "";
+    const markerID = this.markerID;
+    if (!markerID) {
+      console.error("[gm_xhr.ts] SWRequestResultParams::finalUrl", "no markerID");
+    }
+    this.resultParamFinalUrl = redirectedUrls.get(markerID) || "";
     return this.resultParamFinalUrl;
   }
 }
@@ -106,6 +114,7 @@ export class GMXhrFetchStrategy implements GMXhrStrategy {
           }),
           new Promise((r) => setTimeout(r, 800)),
         ]);
+        nwErrorResultPromises.delete(this.resultParam.markerID);
         nwErr = nwErrorResults.get(this.resultParam.markerID);
       }
       if (nwErr) {

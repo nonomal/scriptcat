@@ -1,4 +1,5 @@
 import { type SystemConfig } from "@App/pkg/config/config";
+import Logger from "@App/app/logger/logger";
 import { type ScriptService } from "./script";
 import { type SubscribeService } from "./subscribe";
 
@@ -19,10 +20,17 @@ export const initRegularUpdateCheck = async (systemConfig: SystemConfig) => {
     chrome.storage.local.get(["checkupdate_script_lasttime"]),
     systemConfig.getCheckScriptUpdateCycle(), // check_script_update_cycle
   ]);
-  if (updateCycleSecond === 0) return; // no regular update check
   const now = Date.now();
+  if (updateCycleSecond === 0) {
+    // SW启动时，即使停用了更新功能也要设置一下变数值
+    allowRegularUpdateCheck = now + ALLOW_CHECK_DELAY_MS; // 可以触发alarm的更新程序了
+    // 设定更改的话，现时的Alarm需要清除。不判断是否SW启动了，总之就清除一下
+    chrome.alarms.clear("checkScriptUpdate"); // 如没有可以清除的Alarm，Promise会返回false
+    // 不需要检查更新。退出操作
+    return;
+  }
   let when = 0;
-  const checkupdate_script_lasttime: number = result.checkupdate_script_lasttime || 0;
+  const checkupdate_script_lasttime = (result.checkupdate_script_lasttime as number) || 0;
   // 有 checkupdate_script_lasttime 而且是单数值（上次的定时更新检查有完成）
   if (checkupdate_script_lasttime && (checkupdate_script_lasttime & 1) === 1) {
     const updateCycleMs = updateCycleSecond * 1000;
@@ -53,15 +61,23 @@ export const initRegularUpdateCheck = async (systemConfig: SystemConfig) => {
   allowRegularUpdateCheck = now + ALLOW_CHECK_DELAY_MS; // 可以触发alarm的更新程序了
 };
 
-const setCheckupdateScriptLasttime = async (t: number) => {
+// 监听更新周期配置变更，变更后立即重新设定alarm（否则要等到SW重启才会生效）
+export const watchRegularUpdateCheck = (systemConfig: SystemConfig) => {
+  return systemConfig.addListener("check_script_update_cycle", () => {
+    initRegularUpdateCheck(systemConfig);
+  });
+};
+
+const setCheckupdateScriptLasttime = async (t: number, logger: Logger) => {
   try {
     // 试一下储存。储存不了也没所谓
     await chrome.storage.local.set({ checkupdate_script_lasttime: t });
   } catch (e: any) {
-    console.error(e);
+    logger.warn("store script update check time failed", Logger.E(e));
   }
 };
 
+// 只会由系统Alarm事件呼叫
 export const onRegularUpdateCheckAlarm = async (
   systemConfig: SystemConfig,
   script: ScriptService,
@@ -73,12 +89,18 @@ export const onRegularUpdateCheckAlarm = async (
     chrome.storage.local.get(["checkupdate_script_lasttime"]),
     systemConfig.getCheckScriptUpdateCycle(), // check_script_update_cycle
   ]);
-  if (updateCycleSecond === 0) return null; // no regular update check
-  const checkupdate_script_lasttime: number = result.checkupdate_script_lasttime || 0;
+  if (updateCycleSecond === 0) {
+    // 按道理，不会跑到这个条件
+    // Alarm应没有触发才对。无论为何，还是清一下alarm吧
+    chrome.alarms.clear("checkScriptUpdate");
+    // 不需要检查更新。退出操作
+    return null;
+  }
+  const checkupdate_script_lasttime = (result.checkupdate_script_lasttime as number) || 0;
   const targetWhen = checkupdate_script_lasttime + updateCycleSecond * 1000;
   if (targetWhen - ALARM_TRIGGER_WINDOW_MS > now) return null; // 已检查过了（alarm触发了）
   const storeTime = Math.floor(now / 2) * 2; // 双数
-  await setCheckupdateScriptLasttime(storeTime); // 双数值：alarm触发了，但不知道有没有真的检查好（例如中途浏览器关了）
+  await setCheckupdateScriptLasttime(storeTime, script.logger); // 双数值：alarm触发了，但不知道有没有真的检查好（例如中途浏览器关了）
   const res = await script.checkScriptUpdate({ checkType: "system" });
   try {
     if (subscribe) {
@@ -87,8 +109,8 @@ export const onRegularUpdateCheckAlarm = async (
       await subscribe.checkSubscribeUpdate(updateCycleSecond, checkDisableScript);
     }
   } catch (e: any) {
-    console.error(e);
+    script.logger.error("check subscribe updates failed", Logger.E(e));
   }
-  await setCheckupdateScriptLasttime(storeTime + 1); // 单数值：alarm触发了，而且真的检查好
+  await setCheckupdateScriptLasttime(storeTime + 1, script.logger); // 单数值：alarm触发了，而且真的检查好
   return res;
 };

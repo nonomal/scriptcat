@@ -10,6 +10,8 @@ import DeclarativeNetRequest from "./declarativ_net_request";
 import Permissions from "./permissions";
 import Extension from "./extension";
 import MockUserScripts from "./user_scripts";
+import Action from "./action";
+import WebNavigation from "./web_navigation";
 
 const chromeMock = {
   tabs: new MockTab(),
@@ -24,7 +26,13 @@ const chromeMock = {
   permissions: new Permissions(),
   extension: new Extension(),
   userScripts: new MockUserScripts(),
-  init() {},
+  action: new Action(),
+  webNavigation: new WebNavigation(),
+  init() {
+    this.downloads.reset();
+    this.permissions.reset();
+    this.webRequest.reset();
+  },
 };
 
 export default chromeMock;

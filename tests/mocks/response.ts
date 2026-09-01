@@ -19,7 +19,7 @@ export class MockResponse implements Response {
   readonly type: ResponseType = "basic";
   readonly headers: Headers;
   // @ts-expect-error
-  readonly body: ReadableStream<Uint8Array> | null;
+  readonly body: ReadableStream<Uint8Array<ArrayBufferLike>> | null;
   bodyUsed: boolean = false;
   #bytes: Uint8Array;
 
@@ -50,9 +50,12 @@ export class MockResponse implements Response {
     this.url = init?.url ?? "";
 
     this.body = this.#bytes.length
-      ? new ReadableStream<Uint8Array>({
+      ? new ReadableStream<Uint8Array<ArrayBufferLike>>({
           start: (controller) => {
-            controller.enqueue(this.#bytes);
+            const buffer = new ArrayBuffer(this.#bytes.byteLength);
+            const view = new Uint8Array(buffer);
+            view.set(this.#bytes);
+            controller.enqueue(view);
             controller.close();
           },
           pull: () => {
@@ -110,6 +113,15 @@ export class MockResponse implements Response {
     if (this.bodyUsed) throw new TypeError("Body already consumed");
     (this as any).bodyUsed = true;
     return new TextDecoder().decode(this.#bytes);
+  }
+
+  async bytes(): Promise<Uint8Array<ArrayBuffer>> {
+    if (this.bodyUsed) throw new TypeError("Body already consumed");
+    (this as any).bodyUsed = true;
+    const buffer = new ArrayBuffer(this.#bytes.byteLength);
+    const view = new Uint8Array(buffer);
+    view.set(this.#bytes);
+    return view;
   }
 
   clone(): Response {

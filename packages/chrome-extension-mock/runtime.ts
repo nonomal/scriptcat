@@ -65,6 +65,8 @@ export default class Runtime {
     return port;
   }
 
+  __mockGetURLToExtensionTest: boolean = false;
+
   getURL(_path: string) {
     // implemented with vitest
   }
@@ -98,7 +100,7 @@ export default class Runtime {
           },
         ],
         backScriptList: [],
-        isBlacklist: false,
+        pageStatus: "ok",
       };
     }
 

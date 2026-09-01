@@ -1,11 +1,9 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "lib": [
-      "DOM",
-      "ES2020",
-      "WebWorker"
-    ],
+    "incremental": true,
+    "tsBuildInfoFile": "node_modules/.cache/tsc/.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["DOM", "ES2022", "WebWorker"],
     "module": "nodenext",
     "jsx": "react-jsx",
     "strict": true,
@@ -18,27 +16,17 @@
     "experimentalDecorators": true,
     "useDefineForClassFields": true,
     "allowImportingTsExtensions": true,
-    "baseUrl": ".",
     "paths": {
       "@App/*": [
-        "src/*"
+        "./src/*"
       ],
       "@Packages/*": [
-        "packages/*"
+        "./packages/*"
       ],
       "@Tests/*": [
-        "tests/*"
+        "./tests/*"
       ]
     }
   },
-  "include": [
-    "src",
-    "packages",
-    "tests"
-  ],
-  "ts-node": {
-    "compilerOptions": {
-      "module": "CommonJS"
-    }
-  }
+  "include": ["src", "packages", "tests"]
 }

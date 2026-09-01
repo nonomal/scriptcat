@@ -10,7 +10,7 @@ import {
   SCRIPT_TYPE_CRONTAB,
   SCRIPT_TYPE_NORMAL,
 } from "@App/app/repo/scripts";
-import { disableScript, enableScript, runScript, stopScript } from "../sandbox/client";
+import { disableScript, enableScript, runScript, setSandboxLanguage, stopScript } from "../sandbox/client";
 import { type Group } from "@Packages/message/server";
 import type { MessageSend } from "@Packages/message/types";
 import type { TDeleteScript, TInstallScript, TEnableScript } from "../queue";
@@ -18,17 +18,20 @@ import type { TDeleteScript, TInstallScript, TEnableScript } from "../queue";
 export class ScriptService {
   logger: Logger;
 
-  scriptClient: ScriptClient = new ScriptClient(this.extMsgSender);
-  resourceClient: ResourceClient = new ResourceClient(this.extMsgSender);
-  valueClient: ValueClient = new ValueClient(this.extMsgSender);
+  scriptClient: ScriptClient;
+  resourceClient: ResourceClient;
+  valueClient: ValueClient;
 
   constructor(
     private group: Group,
-    private extMsgSender: MessageSend,
+    private msgSender: MessageSend,
     private windowMessage: WindowMessage,
     private messageQueue: IMessageQueue
   ) {
     this.logger = LoggerCore.logger().with({ service: "script" });
+    this.scriptClient = new ScriptClient(this.msgSender);
+    this.resourceClient = new ResourceClient(this.msgSender);
+    this.valueClient = new ValueClient(this.msgSender);
   }
 
   runScript(script: ScriptRunResource) {
@@ -40,10 +43,13 @@ export class ScriptService {
   }
 
   async init() {
+    this.messageQueue.subscribe<string>("setSandboxLanguage", async (lang) => {
+      setSandboxLanguage(this.windowMessage, lang);
+    });
     this.messageQueue.subscribe<TEnableScript[]>("enableScripts", async (data) => {
       for (const { uuid, enable } of data) {
-        const script = await this.scriptClient.info(uuid);
-        if (script.type === SCRIPT_TYPE_NORMAL) {
+        const script = await this.scriptClient.findInfo(uuid);
+        if (!script || script.type === SCRIPT_TYPE_NORMAL) {
           continue;
         }
         if (enable) {
@@ -69,7 +75,7 @@ export class ScriptService {
         disableScript(this.windowMessage, data.script.uuid);
       }
     });
-    this.messageQueue.subscribe<TDeleteScript[]>("deleteScripts", async (data) => {
+    this.messageQueue.subscribe<TDeleteScript[]>("trashScripts", async (data) => {
       for (const { uuid, type } of data) {
         // 只发送后台脚本和定时脚本
         if (type === SCRIPT_TYPE_BACKGROUND || type === SCRIPT_TYPE_CRONTAB) {

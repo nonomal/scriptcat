@@ -7,11 +7,12 @@ import type { IMessageQueue } from "@Packages/message/message_queue";
 import type { Api, GMApiRequest } from "./types";
 import { cacheInstance } from "@App/app/cache";
 import { CACHE_KEY_PERMISSION } from "@App/app/cache_key";
-import { v4 as uuidv4 } from "uuid";
+import { uuidv4 } from "@App/pkg/utils/uuid";
 import Queue from "@App/pkg/utils/queue";
 import { type TDeleteScript } from "../queue";
 import { openInCurrentTab } from "@App/pkg/utils/utils";
 import type GMApi from "./gm_api/gm_api";
+import { isContextMenuScript } from "../content/utils";
 
 export interface ConfirmParam {
   // 权限名
@@ -28,6 +29,10 @@ export interface ConfirmParam {
   wildcard?: boolean;
   // 权限内容
   permissionContent?: string;
+  // 仅接受持久化（DB 存储）的授权，忽略临时缓存
+  persistentOnly?: boolean;
+  // 需要在确认页面通过用户手势请求的扩展站点访问权限
+  extensionSiteAccessOrigins?: string[];
 }
 
 export interface UserConfirm {
@@ -117,9 +122,17 @@ export default class PermissionVerify {
   }
 
   // 验证是否有权限
-  async verify<T>(request: GMApiRequest<T>, api: ApiValue, sender: IGetSender, GMApiInstance: GMApi): Promise<boolean> {
+  async verify<T extends Array<any>>(
+    request: GMApiRequest<T>,
+    api: ApiValue,
+    sender: IGetSender,
+    GMApiInstance: GMApi
+  ): Promise<boolean> {
     const { alias, link, confirm } = api.param;
     if (api.param.default) {
+      return true;
+    }
+    if (request.api === "GM_registerMenuCommand" && isContextMenuScript(request.script.metadata)) {
       return true;
     }
     // 没有其它条件,从metadata.grant中判断
@@ -181,13 +194,42 @@ export default class PermissionVerify {
     });
   }
 
-  async confirm<T>(request: GMApiRequest<T>, confirm: boolean | ConfirmParam, sender: IGetSender): Promise<boolean> {
-    if (typeof confirm === "boolean") {
-      return confirm;
+  buildCacheKey(
+    request: GMApiRequest,
+    confirm: {
+      permission: string;
+      permissionValue?: string;
     }
-    const cacheKey = `${CACHE_KEY_PERMISSION}${request.script.uuid}:${confirm.permission}:${confirm.permissionValue || ""}`;
+  ) {
+    return `${CACHE_KEY_PERMISSION}${request.script.uuid}:${confirm.permission}:${confirm.permissionValue || ""}`;
+  }
+
+  // 仅查询 DB 中的持久化权限，跳过缓存
+  async queryPersistentPermission<T>(
+    request: GMApiRequest<T>,
+    confirm: {
+      permission: string;
+      permissionValue?: string;
+    }
+  ): Promise<Permission | undefined> {
+    let model = await this.permissionDAO.findByKey(request.uuid, confirm.permission, confirm.permissionValue || "");
+    if (!model) {
+      model = await this.permissionDAO.findByKey(request.uuid, confirm.permission, "*");
+    }
+    return model;
+  }
+
+  async queryPermission<T>(
+    request: GMApiRequest<T>,
+    confirm: {
+      permission: string;
+      permissionValue?: string;
+      wildcard?: boolean;
+    }
+  ): Promise<Permission | undefined> {
+    const cacheKey = this.buildCacheKey(request, confirm);
     // 从数据库中查询是否有此权限
-    const ret = await cacheInstance.getOrSet(cacheKey, async () => {
+    return await cacheInstance.getOrSet(cacheKey, async () => {
       let model = await this.permissionDAO.findByKey(request.uuid, confirm.permission, confirm.permissionValue || "");
       if (!model) {
         // 允许通配
@@ -197,14 +239,32 @@ export default class PermissionVerify {
       }
       return model;
     });
-    // 有查询到结果,进入判断,不再需要用户确认
-    if (ret) {
-      if (ret.allow) {
-        return true;
-      }
-      // 权限拒绝
-      throw new Error("permission denied");
+  }
+
+  async confirm<T>(request: GMApiRequest<T>, confirm: boolean | ConfirmParam, sender: IGetSender): Promise<boolean> {
+    if (typeof confirm === "boolean") {
+      return confirm;
     }
+
+    if (confirm.persistentOnly) {
+      // 仅查询 DB，跳过缓存
+      const ret = await this.queryPersistentPermission(request, confirm);
+      if (ret) {
+        if (ret.allow) return true;
+        throw new Error("permission denied");
+      }
+    } else {
+      const ret = await this.queryPermission(request, confirm);
+      // 有查询到结果,进入判断,不再需要用户确认
+      if (ret) {
+        if (ret.allow) {
+          return true;
+        }
+        // 权限拒绝
+        throw new Error("permission denied");
+      }
+    }
+
     // 没有权限,则弹出页面让用户进行确认
     const userConfirm = await this.confirmWindow(request.script, confirm, sender);
     // 成功存入数据库
@@ -231,11 +291,12 @@ export default class PermissionVerify {
       default:
         break;
     }
-    // 临时 放入缓存
-    if (userConfirm.type >= 2) {
+    // persistentOnly 模式：type 2-3 不缓存（等同于 type 1 的一次性允许）
+    if (!confirm.persistentOnly && userConfirm.type >= 2) {
+      const cacheKey = this.buildCacheKey(request, confirm);
       cacheInstance.set(cacheKey, model);
     }
-    // 总是 放入数据库
+    // 总是 放入数据库（type 4-5 为永久授权）
     if (userConfirm.type >= 4) {
       const oldConfirm = await this.permissionDAO.findByKey(model.uuid, model.permission, model.permissionValue);
       if (!oldConfirm) {

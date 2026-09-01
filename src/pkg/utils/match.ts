@@ -6,6 +6,10 @@ export class UrlMatch<T> {
   public readonly cacheMap = new Map<string, T[]>();
   private sorter: Partial<Record<string, number>> | null = null;
 
+  constructor(private readonly maxCacheEntries: number = 4096) {
+    if (this.maxCacheEntries <= 0) throw new Error(`maxCacheEntries ${this.maxCacheEntries} <= 0`);
+  }
+
   public addRules(uuid: T, rules: URLRuleEntry[]) {
     this.cacheMap.clear();
     let map = this.rulesMap.get(uuid);
@@ -15,30 +19,22 @@ export class UrlMatch<T> {
 
   public urlMatch(url: string): T[] {
     const cacheMap = this.cacheMap;
-    if (cacheMap.has(url)) return cacheMap.get(url) as T[];
-    const s = new Set<T>();
-    for (const [uuid, rules] of this.rulesMap.entries()) {
-      let ruleIncluded = false;
-      let ruleExcluded = false;
-      for (const rule of rules) {
-        if (rule.ruleType & RuleTypeBit.INCLUSION) {
-          // include
-          if (!ruleIncluded && isUrlMatch(url, rule)) {
-            ruleIncluded = true;
-          }
-        } else {
-          // exclude
-          if (!ruleExcluded && !isUrlMatch(url, rule)) {
-            ruleExcluded = true;
-            break;
-          }
+    if (cacheMap.has(url)) {
+      const cached = cacheMap.get(url) as T[];
+      cacheMap.delete(url);
+      cacheMap.set(url, cached);
+      return cached;
+    }
+    const res: T[] = [];
+    for (const [uuid, rules] of this.rulesMap) {
+      try {
+        if (isUrlIncluded(url, rules)) {
+          res.push(uuid);
         }
-      }
-      if (ruleIncluded && !ruleExcluded) {
-        s.add(uuid);
+      } catch (e) {
+        console.warn("Unexpected match error", e);
       }
     }
-    const res = [...s];
     const sorter = this.sorter;
     if (sorter !== null && typeof sorter === "object" && typeof res[0] === "string") {
       (res as string[]).sort((a, b) => {
@@ -51,6 +47,10 @@ export class UrlMatch<T> {
       });
     }
     cacheMap.set(url, res);
+    if (cacheMap.size > this.maxCacheEntries) {
+      const oldest = cacheMap.keys().next().value;
+      if (oldest !== undefined) cacheMap.delete(oldest);
+    }
     return res;
   }
 
@@ -74,7 +74,7 @@ export class UrlMatch<T> {
   }
 
   // 测试用
-  public exclude(rulePattern: string, uuid: T) {
+  public addExclude(rulePattern: string, uuid: T) {
     // @exclude xxxxx
     const rules = extractUrlPatterns([rulePattern].map((e) => `@exclude ${e}`));
     this.addRules(uuid, rules);
@@ -86,6 +86,56 @@ export class UrlMatch<T> {
       this.sorter = sorter;
     }
   }
+}
+
+// 检查单一网址是否符合 Inclusion 原则
+// 即匹配任一@include/@match且不匹配任何@exclude
+export function isUrlIncluded(url: string, rules: URLRuleEntry[]): boolean {
+  let anyInclusionRule = false;
+  let anyExclusionRule = false;
+  for (const rule of rules) {
+    if (rule.ruleType & RuleTypeBit.INCLUSION) {
+      // include
+      if (!anyInclusionRule && isUrlMatch(url, rule)) {
+        // 符合 inclusion
+        anyInclusionRule = true;
+      }
+    } else {
+      // exclude
+      if (!isUrlMatch(url, rule)) {
+        // 符合 exclusion
+        anyExclusionRule = true;
+        break;
+      }
+    }
+  }
+  // true 条件： ( Any @include/@match = true ) AND ( All @exclude = false )
+  return anyInclusionRule && !anyExclusionRule;
+}
+
+// 检查单一网址是否符合 Exclusion 原则
+// 即匹配任何@exclude或所有@include/@match皆不匹配
+export function isUrlExcluded(url: string, rules: URLRuleEntry[]): boolean {
+  let anyInclusionRule = false;
+  let anyExclusionRule = false;
+  for (const rule of rules) {
+    if (rule.ruleType & RuleTypeBit.INCLUSION) {
+      // include
+      if (!anyInclusionRule && isUrlMatch(url, rule)) {
+        // 符合 inclusion
+        anyInclusionRule = true;
+      }
+    } else {
+      // exclude
+      if (!isUrlMatch(url, rule)) {
+        // 符合 exclusion
+        anyExclusionRule = true;
+        break;
+      }
+    }
+  }
+  // true 条件： ( All @include/@match = false ) OR ( Any @exclude = true )
+  return !anyInclusionRule || anyExclusionRule;
 }
 
 export const blackListSelfCheck = (blacklist: string[] | null | undefined) => {

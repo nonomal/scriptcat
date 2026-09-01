@@ -1,14 +1,14 @@
 import { calculateMd5, md5OfText } from "@App/pkg/utils/crypto";
-import type { File, FileReader, FileWriter } from "../filesystem";
+import type { FileInfo, FileReader, FileWriter } from "../filesystem";
 import { joinPath } from "../utils";
 import type OneDriveFileSystem from "./onedrive";
 
 export class OneDriveFileReader implements FileReader {
-  file: File;
+  file: FileInfo;
 
   fs: OneDriveFileSystem;
 
-  constructor(fs: OneDriveFileSystem, file: File) {
+  constructor(fs: OneDriveFileSystem, file: FileInfo) {
     this.fs = fs;
     this.file = file;
   }
@@ -20,7 +20,7 @@ export class OneDriveFileReader implements FileReader {
       true
     );
     if (data.status !== 200) {
-      throw new Error(await data.text());
+      throw await this.fs.createResponseError(data);
     }
     switch (type) {
       case "string":
@@ -58,7 +58,15 @@ export class OneDriveFileWriter implements FileWriter {
 
   async write(content: string | Blob): Promise<void> {
     // 预上传获取id
-    const size = this.size(content).toString();
+    const size = this.size(content);
+    if (size === 0) {
+      const config: RequestInit = {
+        method: "PUT",
+        body: content,
+      };
+      return this.fs.request(`https://graph.microsoft.com/v1.0/me/drive/special/approot:${this.path}:/content`, config);
+    }
+
     let myHeaders = new Headers();
     myHeaders.append("Content-Type", "application/json");
     const uploadUrl = await this.fs
@@ -83,7 +91,7 @@ export class OneDriveFileWriter implements FileWriter {
         return data.uploadUrl;
       });
     myHeaders = new Headers();
-    myHeaders.append("Content-Range", `bytes 0-${parseInt(size, 10) - 1}/${size}`);
+    myHeaders.append("Content-Range", `bytes 0-${size - 1}/${size}`);
     return this.fs.request(uploadUrl, {
       method: "PUT",
       body: content,

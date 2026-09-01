@@ -1,3 +1,4 @@
+import { Native } from "../global";
 import type { CustomEventMessage } from "@Packages/message/custom_event_message";
 import type GMApi from "./gm_api";
 import { dataEncode } from "@App/pkg/utils/xhr/xhr_data";
@@ -5,6 +6,27 @@ import type { MessageConnect, TMessage } from "@Packages/message/types";
 import { base64ToUint8, concatUint8 } from "@App/pkg/utils/datatype";
 import { stackAsyncTask } from "@App/pkg/utils/async_queue";
 import LoggerCore from "@App/app/logger/core";
+
+const ChunkResponseCode = {
+  NONE: 0,
+  READABLE_STREAM: 1,
+  UINT8_ARRAY_BUFFER: 2,
+  STRING: 3,
+} as const;
+
+type ChunkResponseCode = ValueOf<typeof ChunkResponseCode>;
+
+const ReadyStateCode = {
+  UNSENT: 0,
+  OPENED: 1,
+  HEADERS_RECEIVED: 2,
+  LOADING: 3,
+  DONE: 4,
+} as const;
+
+type ReadyStateCode = ValueOf<typeof ReadyStateCode>;
+
+type GMXhrResponseObjectType = ArrayBuffer | Blob | Document | ReadableStream<Uint8Array<ArrayBufferLike>>;
 
 export type ContextType = unknown;
 
@@ -22,16 +44,31 @@ export type GMXHRResponseType = {
   RESPONSE_TYPE_STREAM: string;
   context?: ContextType;
   finalUrl: string;
-  readyState: 0 | 1 | 4 | 2 | 3;
+  readyState: ReadyStateCode;
   status: number;
   statusText: string;
   responseHeaders: string;
   responseType: "" | "text" | "arraybuffer" | "blob" | "json" | "document" | "stream";
-  readonly response: string | ArrayBuffer | Blob | Document | ReadableStream<Uint8Array<ArrayBufferLike>> | null;
-  readonly responseXML: Document | null;
-  readonly responseText: string;
+  readonly response?: string | GMXhrResponseObjectType | null | undefined;
+  readonly responseXML?: Document | null | undefined;
+  readonly responseText?: string | undefined;
   toString: () => string;
   error?: string;
+};
+
+type TXhrCallBackArg = {
+  //
+  finalUrl: string;
+  readyState: ReadyStateCode;
+  status: number;
+  statusText: string;
+  responseHeaders: string;
+  error?: string;
+  //
+  useFetch: boolean;
+  eventType: string;
+  ok: boolean;
+  contentType: string;
 };
 
 export type GMXHRResponseTypeWithError = GMXHRResponseType & Required<Pick<GMXHRResponseType, "error">>;
@@ -49,7 +86,9 @@ export const toBlobURL = (a: GMApi, blob: Blob): Promise<string> | string => {
 export const blobToDataURL = (blob: Blob): Promise<string> => {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
+    reader.onloadend = function () {
+      resolve(<string>reader.result);
+    };
     reader.onerror = reject;
     reader.onabort = reject;
     reader.readAsDataURL(blob);
@@ -73,10 +112,57 @@ export const convObjectToURL = async (object: string | URL | Blob | File | undef
   return url;
 };
 
-export const urlToDocumentInContentPage = async (a: GMApi, url: string) => {
+export const urlToDocumentInContentPage = async (a: GMApi, url: string, isContent: boolean) => {
   // url (e.g. blob url) -> XMLHttpRequest (CONTENT) -> Document (CONTENT)
-  const nodeId = await a.sendMessage("CAT_fetchDocument", [url]);
+  const nodeId = await a.sendMessage("CAT_fetchDocument", [`${url}`, isContent]);
   return (<CustomEventMessage>a.message).getAndDelRelatedTarget(nodeId) as Document;
+};
+
+const getMimeType = (contentType: string) => {
+  let mime = contentType;
+  const i = mime.indexOf(";");
+  if (i > 0) mime = mime.substring(0, i);
+  mime = mime.trim().toLowerCase();
+  return mime;
+};
+
+const docParseTypes = new Set(["application/xhtml+xml", "application/xml", "image/svg+xml", "text/html", "text/xml"]);
+
+const retStateFnMap = new WeakMap<ThisType<GMXHRResponseType>, RetStateFnRecord>();
+
+interface RetStateFnRecord {
+  getResponseText(): string | undefined;
+  getResponseXML(): Document | null | undefined;
+  getResponse(): string | GMXhrResponseObjectType | null | undefined;
+}
+
+// 对齐 TM, getter属性 enumerable=false 及 configurable=false
+// 这影响 Object.assign({}, response) 的行为
+const xhrResponseGetters = {
+  response: {
+    get() {
+      const retTemp = retStateFnMap.get(this);
+      return retTemp?.getResponse();
+    },
+    enumerable: false,
+    configurable: false,
+  },
+  responseXML: {
+    get() {
+      const retTemp = retStateFnMap.get(this);
+      return retTemp?.getResponseXML();
+    },
+    enumerable: false,
+    configurable: false,
+  },
+  responseText: {
+    get() {
+      const retTemp = retStateFnMap.get(this);
+      return retTemp?.getResponseText();
+    },
+    enumerable: false,
+    configurable: false,
+  },
 };
 
 export function GM_xmlhttpRequest(
@@ -116,7 +202,7 @@ export function GM_xmlhttpRequest(
     details.method = `${details.method}`.toUpperCase() as typeof details.method;
   }
 
-  const param: GMSend.XHRDetails = {
+  let param: GMSend.XHRDetails | null = {
     method: details.method,
     timeout: details.timeout,
     url: "",
@@ -138,20 +224,21 @@ export function GM_xmlhttpRequest(
   }
   let connect: MessageConnect | null;
   const responseTypeOriginal = details.responseType?.toLocaleLowerCase() || "";
-  let doAbort: any = null;
-  const handler = async () => {
+  let doAbort: ((o: TXhrCallBackArg) => void) | null = null;
+  (async () => {
     const [urlResolved, dataResolved] = await Promise.all([urlPromiseLike, dataPromise]);
     const u = new URL(urlResolved, window.location.href);
     param.url = u.href;
     param.data = dataResolved;
 
     // 处理返回数据
-    let readerStream: ReadableStream<Uint8Array> | undefined;
+    const isStreamResponse = responseTypeOriginal === "stream";
+    let readerStream: ReadableStream<Uint8Array<ArrayBufferLike>> | undefined;
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
     // 如果返回类型是arraybuffer或者blob的情况下,需要将返回的数据转化为blob
     // 在background通过URL.createObjectURL转化为url,然后在content页读取url获取blob对象
-    if (responseTypeOriginal === "stream") {
-      readerStream = new ReadableStream<Uint8Array>({
+    if (isStreamResponse) {
+      readerStream = new ReadableStream<Uint8Array<ArrayBufferLike>>({
         start(ctrl) {
           controller = ctrl;
         },
@@ -172,9 +259,6 @@ export function GM_xmlhttpRequest(
           break;
       }
     }
-    const xhrType = param.responseType;
-    const responseType = responseTypeOriginal; // 回传用
-
     // 发送信息
     let connectMessage: Promise<MessageConnect>;
     if (isDownload) {
@@ -187,437 +271,458 @@ export function GM_xmlhttpRequest(
       // 一般 GM_xmlhttpRequest，呼叫 SW 的 GM_xmlhttpRequest
       connectMessage = a.connect("GM_xmlhttpRequest", [param]);
     }
-    connectMessage.then((con) => {
-      // 注意。在此 callback 里，不应直接存取 param, 否则会影响 GC
-      connect = con;
-      const resultTexts = [] as string[]; // 函数参考清掉后，变数会被GC
-      const resultBuffers = [] as Uint8Array<ArrayBuffer>[]; // 函数参考清掉后，变数会被GC
-      let finalResultBuffers: Uint8Array<ArrayBuffer> | null = null; // 函数参考清掉后，变数会被GC
-      let finalResultText: string | null = null; // 函数参考清掉后，变数会被GC
-      let isEmptyResult = true;
-      const asyncTaskId = `${Date.now}:${Math.random()}`;
-      let lastStateAndCode = "";
+    param = null; // GC
+    connect = await connectMessage;
 
-      let errorOccur: string | null = null;
-      let response: unknown = null;
-      let responseText: string | undefined | false = "";
-      let responseXML: unknown = null;
-      let resultType = 0;
-      if (readerStream) {
-        response = readerStream;
-        responseText = undefined; // 兼容
-        responseXML = undefined; // 兼容
-      }
+    const resultTexts = [] as string[]; // 函数参考清掉后，变数会被GC
+    const resultBuffers = [] as Uint8Array<ArrayBuffer>[]; // 函数参考清掉后，变数会被GC
+    let finalResultBuffers: Uint8Array<ArrayBuffer> | null = null; // 函数参考清掉后，变数会被GC
+    let finalResultText: string | null = null; // 函数参考清掉后，变数会被GC
+    let isEmptyResult = true;
+    const asyncTaskId = `${Date.now()}:${Math.random()}`;
+    let lastStateAndCode = "";
+    let allowResponse = false; // readyState 未达至 4 (DONE) 时，不提供 response, responseText, responseXML
+
+    let errorOccur: string | null = null;
+    let response: unknown = null;
+    let responseText: string | undefined | false = "";
+    let responseXML: unknown = null;
+    let resultType: ChunkResponseCode = ChunkResponseCode.NONE;
+    if (readerStream) {
+      allowResponse = true; // TM 特殊处理。 fetchXhr stream 无视 readyState
+      response = readerStream;
+      responseText = undefined; // TM兼容
+      responseXML = undefined; // TM兼容
       readerStream = undefined;
+    }
 
-      let refCleanup: (() => void) | null = () => {
-        // 清掉函数参考，避免各变数参考无法GC
-        makeXHRCallbackParam = null;
-        onMessageHandler = null;
-        doAbort = null;
-        refCleanup = null;
-        connect = null;
+    let refCleanup: (() => void) | null = () => {
+      // 执行此操作会使连结断开。因此 fetch error, timeout 等出现后不能立即执行，应留待 onloadend 后呼叫
+      // 清掉函数参考，避免各变数参考无法GC
+      makeXHRCallbackParam = null;
+      onMessageHandler = null;
+      doAbort = null;
+      refCleanup = null;
+      connect?.disconnect(true); // 确保 connect 断开
+      connect = null;
+    };
+
+    const markResponseDirty = () => {
+      // 标记内部变数需要重新读取
+      // reqDone 或 readerStream 的情况，不需要重置
+      if (!reqDone && !isStreamResponse) {
+        response = false;
+        responseText = false;
+        responseXML = false;
+        finalResultText = null;
+        finalResultBuffers = null;
+      }
+    };
+
+    const makeRetTemp = (contentType: string) => {
+      return {
+        getResponse() {
+          if (response === false) {
+            // 注： isStreamResponse 为 true 时 response 不会为 false
+            switch (responseTypeOriginal) {
+              case "json": {
+                const text = this.getResponseText();
+                let o = undefined;
+                if (text) {
+                  try {
+                    o = Native.jsonParse(text);
+                  } catch {
+                    // ignored
+                  }
+                }
+                response = o; // TM兼容 -> o : object | undefined
+                break;
+              }
+              case "document": {
+                response = this.getResponseXML();
+                break;
+              }
+              case "arraybuffer": {
+                finalResultBuffers ||= concatUint8(resultBuffers);
+                const full = finalResultBuffers;
+                response = full.buffer; // ArrayBuffer
+                break;
+              }
+              case "blob": {
+                finalResultBuffers ||= concatUint8(resultBuffers);
+                const full = finalResultBuffers;
+                const type = contentType || "application/octet-stream";
+                response = new Blob([full], { type }); // Blob
+                break;
+              }
+              default: {
+                // text
+                response = `${this.getResponseText()}`;
+                break;
+              }
+            }
+            if (reqDone) {
+              resultTexts.length = 0;
+              resultBuffers.length = 0;
+            }
+          }
+          if (responseTypeOriginal === "json" && response === null) {
+            response = undefined; // TM不使用null，使用undefined
+          }
+          return response as string | GMXhrResponseObjectType | null | undefined;
+        },
+        getResponseXML() {
+          if (responseXML === false) {
+            // 注： isStreamResponse 为 true 时 responseXML 不会为 false
+            const text = this.getResponseText();
+            const mime = getMimeType(contentType);
+            const parseType = docParseTypes.has(mime) ? (mime as DOMParserSupportedType) : "text/xml";
+            if (text !== undefined) {
+              try {
+                responseXML = new DOMParser().parseFromString(text, parseType);
+              } catch (e) {
+                // 对齐 TM 处理。Trusted Type Policy受限制时返回 null
+                responseXML = null;
+                console.error(e);
+              }
+            } else {
+              responseXML = undefined;
+            }
+          }
+          return responseXML as Document | null | undefined;
+        },
+        getResponseText() {
+          if (responseText === false) {
+            // 注： isStreamResponse 为 true 时 responseText 不会为 false
+            if (resultType === ChunkResponseCode.UINT8_ARRAY_BUFFER) {
+              finalResultBuffers ||= concatUint8(resultBuffers);
+              const buf = finalResultBuffers.buffer as ArrayBuffer;
+              const decoder = new TextDecoder("utf-8");
+              const text = decoder.decode(buf);
+              responseText = text;
+            } else {
+              // resultType === ChunkResponseCode.STRING
+              if (finalResultText === null) finalResultText = `${resultTexts.join("")}`;
+              responseText = finalResultText;
+            }
+            if (reqDone) {
+              resultTexts.length = 0;
+              resultBuffers.length = 0;
+            }
+          }
+          return responseText as string | undefined;
+        },
       };
+    };
 
-      const makeXHRCallbackParam_ = (
-        res: {
+    const makeResponseRet = (retParam: GMXHRResponseType, addGetters: boolean, contentType: string) => {
+      let descriptors: ReturnType<typeof Object.getOwnPropertyDescriptors<GMXHRResponseType>> = {
+        ...Native.objectGetOwnPropertyDescriptors(retParam),
+      };
+      if (!addGetters) return Native.objectCreate(null, descriptors);
+      descriptors = {
+        ...descriptors,
+        ...xhrResponseGetters,
+      };
+      // 对齐 TM, res.constructor = undefined, res.__proto__ = undefined
+      const retParamObject: GMXHRResponseType = Native.objectCreate(null, descriptors);
+      // 外部没引用 retParamObject 时，retTemp 会被自动GC
+      const retTemp = makeRetTemp(contentType);
+      retStateFnMap.set(retParamObject, retTemp);
+      return retParamObject;
+    };
+
+    const makeXHRCallbackParam_ = (res: TXhrCallBackArg) => {
+      if ((res.readyState === 4 || reqDone) && res.eventType !== "progress") allowResponse = true;
+      let resError: Record<string, any> | null = null;
+      if (
+        (typeof res.error === "string" &&
+          (res.status === 0 || res.status >= 300 || res.status < 200) &&
+          !res.statusText &&
+          isEmptyResult) ||
+        res.error === "aborted"
+      ) {
+        resError = {
+          error: res.error as string,
+          readyState: res.readyState as ReadyStateCode,
+          // responseType: responseType as "text" | "arraybuffer" | "blob" | "json" | "document" | "stream" | "",
+          response: null,
+          responseHeaders: res.responseHeaders as string,
+          responseText: "",
+          status: res.status as number,
+          statusText: "",
+        };
+      }
+      const responseTypeDef = {
+        DONE: ReadyStateCode.DONE,
+        HEADERS_RECEIVED: ReadyStateCode.HEADERS_RECEIVED,
+        LOADING: ReadyStateCode.LOADING,
+        OPENED: ReadyStateCode.OPENED,
+        UNSENT: ReadyStateCode.UNSENT,
+        RESPONSE_TYPE_TEXT: "text",
+        RESPONSE_TYPE_ARRAYBUFFER: "arraybuffer",
+        RESPONSE_TYPE_BLOB: "blob",
+        RESPONSE_TYPE_DOCUMENT: "document",
+        RESPONSE_TYPE_JSON: "json",
+        RESPONSE_TYPE_STREAM: "stream",
+        toString: () => "[object Object]", // follow TM
+      } as GMXHRResponseType;
+      let retParam: GMXHRResponseType;
+      let addGetters = false;
+      if (resError) {
+        retParam = {
+          ...responseTypeDef,
+          ...resError,
+        } as GMXHRResponseType;
+      } else {
+        const retParamBase = {
+          ...responseTypeDef,
+          finalUrl: res.finalUrl as string,
+          readyState: res.readyState as ReadyStateCode,
+          status: res.status as number,
+          statusText: res.statusText as string,
+          responseHeaders: res.responseHeaders as string,
+          responseType: responseTypeOriginal as "text" | "arraybuffer" | "blob" | "json" | "document" | "stream" | "",
+        };
+        if (allowResponse) {
+          // 依照 TM 的规则：当 readyState 不等于 4 时，回应中不会有 response、responseXML 或 responseText。
+          addGetters = true;
+        }
+        retParam = retParamBase;
+        if (res.error) {
+          retParam.error = res.error;
+        }
+      }
+      if (typeof contentContext !== "undefined") {
+        retParam.context = contentContext;
+      }
+
+      return makeResponseRet(retParam, addGetters, res.contentType);
+    };
+    let makeXHRCallbackParam: typeof makeXHRCallbackParam_ | null = makeXHRCallbackParam_;
+    let loadendCalled = false;
+    const doLoadEnd = (data: TXhrCallBackArg) => {
+      if (!loadendCalled) {
+        loadendCalled = true;
+        reqDone = true;
+        responseText = false;
+        finalResultBuffers = null;
+        finalResultText = null;
+        const xhrResponse = makeXHRCallbackParam?.(data) ?? {};
+        details.onloadend?.(xhrResponse);
+        if (errorOccur === null) {
+          retPromiseResolve?.(xhrResponse);
+        } else {
+          retPromiseReject?.(errorOccur);
+        }
+        refCleanup?.();
+      }
+    };
+    doAbort = (data: TXhrCallBackArg) => {
+      if (!reqDone) {
+        errorOccur = "AbortError";
+        details.onabort?.(makeXHRCallbackParam?.(data) ?? {});
+        reqDone = true;
+        // 不要进行 refCleanup ！要等待最后的 onloadend
+        // refCleanup?.();
+        // doAbort 不是由通讯管控 onloadend. 需要手动处理. 排程在下一个 microTask 避免影响 Abort 流程
+        Promise.resolve({ ...data, type: "loadend" }).then(doLoadEnd);
+      }
+      doAbort = null;
+    };
+
+    let onMessageHandler: ((data: TMessage<any>) => void) | null = (msgData: TMessage<any>) => {
+      stackAsyncTask(asyncTaskId, async () => {
+        const data = msgData.data as Record<string, any> & {
           //
           finalUrl: string;
-          readyState: 0 | 4 | 2 | 3 | 1;
+          readyState: ReadyStateCode;
           status: number;
           statusText: string;
           responseHeaders: string;
-          error?: string;
           //
           useFetch: boolean;
           eventType: string;
           ok: boolean;
           contentType: string;
-        } & Record<string, any>
-      ) => {
-        let resError: Record<string, any> | null = null;
-        if (
-          (typeof res.error === "string" &&
-            (res.status === 0 || res.status >= 300 || res.status < 200) &&
-            !res.statusText &&
-            isEmptyResult) ||
-          res.error === "aborted"
-        ) {
-          resError = {
-            error: res.error as string,
-            readyState: res.readyState as 0 | 4 | 2 | 3 | 1,
-            // responseType: responseType as "text" | "arraybuffer" | "blob" | "json" | "document" | "stream" | "",
-            response: null,
-            responseHeaders: res.responseHeaders as string,
-            responseText: "",
-            status: res.status as number,
-            statusText: "",
-          };
-        }
-        let retParam;
-        if (resError) {
-          retParam = {
-            DONE: 4,
-            HEADERS_RECEIVED: 2,
-            LOADING: 3,
-            OPENED: 1,
-            UNSENT: 0,
-            RESPONSE_TYPE_TEXT: "text",
-            RESPONSE_TYPE_ARRAYBUFFER: "arraybuffer",
-            RESPONSE_TYPE_BLOB: "blob",
-            RESPONSE_TYPE_DOCUMENT: "document",
-            RESPONSE_TYPE_JSON: "json",
-            RESPONSE_TYPE_STREAM: "stream",
-            toString: () => "[object Object]", // follow TM
-            ...resError,
-          } as GMXHRResponseType;
-        } else {
-          retParam = {
-            DONE: 4,
-            HEADERS_RECEIVED: 2,
-            LOADING: 3,
-            OPENED: 1,
-            UNSENT: 0,
-            RESPONSE_TYPE_TEXT: "text",
-            RESPONSE_TYPE_ARRAYBUFFER: "arraybuffer",
-            RESPONSE_TYPE_BLOB: "blob",
-            RESPONSE_TYPE_DOCUMENT: "document",
-            RESPONSE_TYPE_JSON: "json",
-            RESPONSE_TYPE_STREAM: "stream",
-            finalUrl: res.finalUrl as string,
-            readyState: res.readyState as 0 | 4 | 2 | 3 | 1,
-            status: res.status as number,
-            statusText: res.statusText as string,
-            responseHeaders: res.responseHeaders as string,
-            responseType: responseType as "text" | "arraybuffer" | "blob" | "json" | "document" | "stream" | "",
-            get response() {
-              if (response === false) {
-                switch (responseTypeOriginal) {
-                  case "json": {
-                    const text = this.responseText;
-                    let o = undefined;
-                    try {
-                      o = JSON.parse(text);
-                    } catch {
-                      // ignored
-                    }
-                    response = o; // TM兼容 -> o : object | undefined
-                    break;
-                  }
-                  case "document": {
-                    response = this.responseXML;
-                    break;
-                  }
-                  case "arraybuffer": {
-                    finalResultBuffers ||= concatUint8(resultBuffers);
-                    const full = finalResultBuffers;
-                    response = full.buffer; // ArrayBuffer
-                    break;
-                  }
-                  case "blob": {
-                    finalResultBuffers ||= concatUint8(resultBuffers);
-                    const full = finalResultBuffers;
-                    const type = res.contentType || "application/octet-stream";
-                    response = new Blob([full], { type }); // Blob
-                    break;
-                  }
-                  default: {
-                    // text
-                    response = `${this.responseText}`;
-                    break;
-                  }
-                }
-                if (reqDone) {
-                  resultTexts.length = 0;
-                  resultBuffers.length = 0;
-                }
-              }
-              return response as string | ArrayBuffer | Blob | Document | ReadableStream<Uint8Array> | null;
-            },
-            get responseXML() {
-              if (responseXML === false) {
-                const text = this.responseText;
-                if (
-                  ["application/xhtml+xml", "application/xml", "image/svg+xml", "text/html", "text/xml"].includes(
-                    res.contentType
-                  )
-                ) {
-                  responseXML = new DOMParser().parseFromString(text, res.contentType as DOMParserSupportedType);
-                } else {
-                  responseXML = new DOMParser().parseFromString(text, "text/xml");
-                }
-              }
-              return responseXML as Document | null;
-            },
-            get responseText() {
-              if (responseText === false) {
-                if (resultType === 2) {
-                  finalResultBuffers ||= concatUint8(resultBuffers);
-                  const buf = finalResultBuffers.buffer as ArrayBuffer;
-                  const decoder = new TextDecoder("utf-8");
-                  const text = decoder.decode(buf);
-                  responseText = text;
-                } else {
-                  if (finalResultText === null) finalResultText = `${resultTexts.join("")}`;
-                  responseText = finalResultText;
-                }
-                if (reqDone) {
-                  resultTexts.length = 0;
-                  resultBuffers.length = 0;
-                }
-              }
-              return responseText as string;
-            },
-            toString: () => "[object Object]", // follow TM
-          } as GMXHRResponseType;
-          if (res.error) {
-            retParam.error = res.error;
-          }
-          if (responseType === "json" && retParam.response === null) {
-            response = undefined; // TM不使用null，使用undefined
-          }
-        }
-        if (typeof contentContext !== "undefined") {
-          retParam.context = contentContext;
-        }
-        return retParam;
-      };
-      let makeXHRCallbackParam: typeof makeXHRCallbackParam_ | null = makeXHRCallbackParam_;
-      doAbort = (data: any) => {
-        if (!reqDone) {
-          errorOccur = "AbortError";
-          details.onabort?.(makeXHRCallbackParam?.(data) ?? {});
-          reqDone = true;
-          refCleanup?.();
-        }
-        doAbort = null;
-      };
-
-      let onMessageHandler: ((data: TMessage<any>) => void) | null = (msgData: TMessage<any>) => {
-        stackAsyncTask(asyncTaskId, async () => {
-          const data = msgData.data as Record<string, any> & {
-            //
-            finalUrl: string;
-            readyState: 0 | 4 | 2 | 3 | 1;
-            status: number;
-            statusText: string;
-            responseHeaders: string;
-            //
-            useFetch: boolean;
-            eventType: string;
-            ok: boolean;
-            contentType: string;
-            error: undefined | string;
-          };
-          if (msgData.code === -1) {
-            // 处理错误
-            LoggerCore.logger().error("GM_xmlhttpRequest error", {
-              code: msgData.code,
-              message: msgData.message,
-            });
+          error: undefined | string;
+        };
+        if (msgData.code === -1) {
+          // 处理错误
+          const message = msgData.message || "unknown";
+          const code = msgData.code;
+          LoggerCore.logger().error("GM_xmlhttpRequest error", {
+            code: code,
+            message,
+          });
+          if (!reqDone) {
+            errorOccur = message;
             details.onerror?.({
-              readyState: 4,
-              error: msgData.message || "unknown",
+              readyState: ReadyStateCode.DONE,
+              error: message,
             });
-            return;
+            reqDone = true;
+            // 不要进行 refCleanup ！要等待最后的 onloadend
+            // refCleanup?.();
+
+            // 此错误多为 API 非正常执行，估计不会有 loadend 触发。见 Aborted 处理
+            Promise.resolve({
+              error: "loadend",
+              responseHeaders: "",
+              readyState: 0,
+              status: 0,
+              statusText: "",
+            } as TXhrCallBackArg).then(doLoadEnd);
           }
-          // 处理返回
-          switch (msgData.action) {
-            case "reset_chunk_arraybuffer":
-            case "reset_chunk_blob":
-            case "reset_chunk_buffer": {
-              resultBuffers.length = 0;
-              isEmptyResult = true;
+          return;
+        }
+        // 处理返回
+        switch (msgData.action) {
+          case "reset_chunk_arraybuffer":
+          case "reset_chunk_blob":
+          case "reset_chunk_buffer": {
+            if (reqDone || isStreamResponse) {
+              // 理论上不应发生，仅作为逻辑控制的保护。
+              console.error("Invalid call of reset_chunk [buf]");
               break;
             }
-            case "reset_chunk_document":
-            case "reset_chunk_json":
-            case "reset_chunk_text": {
-              resultTexts.length = 0;
-              isEmptyResult = true;
+            resultBuffers.length = 0;
+            isEmptyResult = true;
+            markResponseDirty();
+            break;
+          }
+          case "reset_chunk_document":
+          case "reset_chunk_json":
+          case "reset_chunk_text": {
+            if (reqDone || isStreamResponse) {
+              // 理论上不应发生，仅作为逻辑控制的保护。
+              console.error("Invalid call of reset_chunk [str]");
               break;
             }
-            case "append_chunk_stream": {
-              const d = msgData.data.chunk as string;
-              const u8 = base64ToUint8(d);
-              resultBuffers.push(u8);
-              isEmptyResult = false;
-              controller?.enqueue(base64ToUint8(d));
-              resultType = 1;
+            resultTexts.length = 0;
+            isEmptyResult = true;
+            markResponseDirty();
+            break;
+          }
+          case "append_chunk_stream": {
+            // by fetch_xhr, isStreamResponse = true
+            const d = msgData.data.chunk as string;
+            const u8 = base64ToUint8(d);
+            resultBuffers.push(u8);
+            isEmptyResult = false;
+            controller?.enqueue(base64ToUint8(d));
+            resultType = ChunkResponseCode.READABLE_STREAM;
+            break;
+          }
+          case "append_chunk_arraybuffer":
+          case "append_chunk_blob":
+          case "append_chunk_buffer": {
+            if (reqDone || isStreamResponse) {
+              // 理论上不应发生，仅作为逻辑控制的保护。
+              console.error("Invalid call of append_chunk [buf]");
               break;
             }
-            case "append_chunk_arraybuffer":
-            case "append_chunk_blob":
-            case "append_chunk_buffer": {
-              const d = msgData.data.chunk as string;
-              const u8 = base64ToUint8(d);
-              resultBuffers.push(u8);
-              isEmptyResult = false;
-              resultType = 2;
+            const d = msgData.data.chunk as string;
+            const u8 = base64ToUint8(d);
+            resultBuffers.push(u8);
+            isEmptyResult = false;
+            resultType = ChunkResponseCode.UINT8_ARRAY_BUFFER;
+            markResponseDirty();
+            break;
+          }
+          case "append_chunk_document":
+          case "append_chunk_json":
+          case "append_chunk_text": {
+            if (reqDone || isStreamResponse) {
+              // 理论上不应发生，仅作为逻辑控制的保护。
+              console.error("Invalid call of append_chunk [str]");
               break;
             }
-            case "append_chunk_document":
-            case "append_chunk_json":
-            case "append_chunk_text": {
-              const d = msgData.data.chunk as string;
-              resultTexts.push(d);
-              isEmptyResult = false;
-              resultType = 3;
-              break;
+            const d = msgData.data.chunk as string;
+            resultTexts.push(d);
+            isEmptyResult = false;
+            resultType = ChunkResponseCode.STRING;
+            markResponseDirty();
+            break;
+          }
+          case "onload":
+            details.onload?.(makeXHRCallbackParam?.(data) ?? {});
+            break;
+          case "onloadend": {
+            doLoadEnd(data);
+            break;
+          }
+          case "onloadstart":
+            details.onloadstart?.(makeXHRCallbackParam?.(data) ?? {});
+            break;
+          case "onprogress": {
+            if (details.onprogress) {
+              const res = {
+                ...(makeXHRCallbackParam?.(data) ?? {}),
+                lengthComputable: data.lengthComputable as boolean,
+                loaded: data.loaded as number,
+                total: data.total as number,
+                done: data.loaded,
+                totalSize: data.total,
+              };
+              details.onprogress?.(res);
             }
-            case "onload":
-              details.onload?.(makeXHRCallbackParam?.(data) ?? {});
-              break;
-            case "onloadend": {
+            break;
+          }
+          case "onreadystatechange": {
+            // 避免xhr的readystatechange多次触发问题。见 https://github.com/violentmonkey/violentmonkey/issues/1862
+            const curStateAndCode = `${data.readyState}:${data.status}`;
+            if (curStateAndCode === lastStateAndCode) return;
+            lastStateAndCode = curStateAndCode;
+            if (isStreamResponse && data.readyState === ReadyStateCode.DONE) {
+              // readable stream 的 controller 可以释放
+              controller = undefined; // GC用
+            }
+            details.onreadystatechange?.(makeXHRCallbackParam?.(data) ?? {});
+            break;
+          }
+          case "ontimeout":
+            if (!reqDone) {
+              errorOccur = "TimeoutError";
+              details.ontimeout?.(makeXHRCallbackParam?.(data) ?? {});
               reqDone = true;
-              responseText = false;
-              finalResultBuffers = null;
-              finalResultText = null;
-              const xhrReponse = makeXHRCallbackParam?.(data) ?? {};
-              details.onloadend?.(xhrReponse);
-              if (errorOccur === null) {
-                retPromiseResolve?.(xhrReponse);
-              } else {
-                retPromiseReject?.(errorOccur);
-              }
-              refCleanup?.();
-              break;
+              // 不要进行 refCleanup ！要等待最后的 onloadend
+              // refCleanup?.();
             }
-            case "onloadstart":
-              details.onloadstart?.(makeXHRCallbackParam?.(data) ?? {});
-              break;
-            case "onprogress": {
-              if (details.onprogress) {
-                if (!xhrType || xhrType === "text") {
-                  responseText = false; // 设为false 表示需要更新。在 get setter 中更新
-                  response = false; // 设为false 表示需要更新。在 get setter 中更新
-                  responseXML = false; // 设为false 表示需要更新。在 get setter 中更新
-                }
-                const res = {
-                  ...(makeXHRCallbackParam?.(data) ?? {}),
-                  lengthComputable: data.lengthComputable as boolean,
-                  loaded: data.loaded as number,
-                  total: data.total as number,
-                  done: data.loaded,
-                  totalSize: data.total,
-                };
-                details.onprogress?.(res);
-              }
-              break;
+            break;
+          case "onerror":
+            if (!reqDone) {
+              data.error ||= "Unknown Error";
+              errorOccur = data.error;
+              details.onerror?.((makeXHRCallbackParam?.(data) ?? {}) as GMXHRResponseTypeWithError);
+              reqDone = true;
+              // 不要进行 refCleanup ！要等待最后的 onloadend
+              // refCleanup?.();
             }
-            case "onreadystatechange": {
-              // 避免xhr的readystatechange多次触发问题。见 https://github.com/violentmonkey/violentmonkey/issues/1862
-              const curStateAndCode = `${data.readyState}:${data.status}`;
-              if (curStateAndCode === lastStateAndCode) return;
-              lastStateAndCode = curStateAndCode;
-              if (data.readyState === 4) {
-                if (resultType === 1) {
-                  // stream type
-                  controller = undefined; // GC用
-                } else if (resultType === 2) {
-                  // buffer type
-                  responseText = false; // 设为false 表示需要更新。在 get setter 中更新
-                  response = false; // 设为false 表示需要更新。在 get setter 中更新
-                  responseXML = false; // 设为false 表示需要更新。在 get setter 中更新
-                  /*
-                    if (xhrType === "blob") {
-                      const full = concatUint8(resultBuffers);
-                      const type = data.data.contentType || "application/octet-stream";
-                      response = new Blob([full], { type }); // Blob
-                      if (responseTypeOriginal === "document") {
-                        const blobURL = await toBlobURL(a, response as Blob);
-                        const document = await urlToDocumentLocal(a, blobURL);
-                        response = document;
-                        responseXML = document;
-                      }
-                    } else if (xhrType === "arraybuffer") {
-                      const full = concatUint8(resultBuffers);
-                      response = full.buffer; // ArrayBuffer
-                    }
-                      */
-                } else if (resultType === 3) {
-                  // string type
+            break;
+          case "onabort":
+            doAbort?.(data);
+            break;
+          // case "onstream":
+          //   controller?.enqueue(new Uint8Array(data));
+          //   break;
+          default:
+            LoggerCore.logger().warn("GM_xmlhttpRequest resp is error", {
+              data: msgData,
+            });
+            break;
+        }
+      });
+    };
 
-                  responseText = false; // 设为false 表示需要更新。在 get setter 中更新
-                  response = false; // 设为false 表示需要更新。在 get setter 中更新
-                  responseXML = false; // 设为false 表示需要更新。在 get setter 中更新
-                  /*
-                    if (xhrType === "json") {
-                      const full = resultTexts.join("");
-                      try {
-                        response = JSON.parse(full);
-                      } catch {
-                        response = null;
-                      }
-                      responseText = full; // XHR exposes responseText even for JSON
-                    } else if (xhrType === "document") {
-                      // 不应该出现 document type
-                      console.error("ScriptCat: Invalid Calling in GM_xmlhttpRequest");
-                      responseText = "";
-                      response = null;
-                      responseXML = null;
-                      // const full = resultTexts.join("");
-                      // try {
-                      //   response = strToDocument(a, full, data.data.contentType as DOMParserSupportedType);
-                      // } catch {
-                      //   response = null;
-                      // }
-                      // if (response) {
-                      //   responseXML = response;
-                      // }
-                    } else {
-                      const full = resultTexts.join("");
-                      response = full;
-                      responseText = full;
-                    }
-                      */
-                }
-              }
-              details.onreadystatechange?.(makeXHRCallbackParam?.(data) ?? {});
-              break;
-            }
-            case "ontimeout":
-              if (!reqDone) {
-                errorOccur = "TimeoutError";
-                details.ontimeout?.(makeXHRCallbackParam?.(data) ?? {});
-                reqDone = true;
-                refCleanup?.();
-              }
-              break;
-            case "onerror":
-              if (!reqDone) {
-                data.error ||= "Unknown Error";
-                errorOccur = data.error;
-                details.onerror?.((makeXHRCallbackParam?.(data) ?? {}) as GMXHRResponseTypeWithError);
-                reqDone = true;
-                refCleanup?.();
-              }
-              break;
-            case "onabort":
-              doAbort?.(data);
-              break;
-            // case "onstream":
-            //   controller?.enqueue(new Uint8Array(data));
-            //   break;
-            default:
-              LoggerCore.logger().warn("GM_xmlhttpRequest resp is error", {
-                data: msgData,
-              });
-              break;
-          }
-        });
-      };
-
-      connect?.onMessage((msgData) => onMessageHandler?.(msgData));
-    });
-  };
+    connect?.onMessage((msgData) => onMessageHandler?.(msgData));
+  })();
   // 由于需要同步返回一个abort，但是一些操作是异步的，所以需要在这里处理
-  handler();
   return {
     retPromise,
     abort: () => {
       if (connect) {
-        connect.disconnect();
+        connect.disconnect(true); // 断开连结(容忍已断开)
         connect = null;
       }
       if (doAbort && details.onabort && !reqDone) {
@@ -629,7 +734,7 @@ export function GM_xmlhttpRequest(
           readyState: 0,
           status: 0,
           statusText: "",
-        }) as GMXHRResponseType;
+        } as TXhrCallBackArg);
         reqDone = true;
       }
     },

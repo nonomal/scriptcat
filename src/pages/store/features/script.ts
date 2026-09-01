@@ -1,16 +1,20 @@
 import type { Script } from "@App/app/repo/scripts";
 import {
+  AgentClient,
+  LogClient,
+  ExternalAccessClient,
   PermissionClient,
   PopupClient,
   ResourceClient,
   RuntimeClient,
+  NetworkRuleClient,
   ScriptClient,
   SubscribeClient,
   SynchronizeClient,
   ValueClient,
 } from "@App/app/service/service_worker/client";
 import { message } from "../global";
-import type { SearchType, TBatchUpdateListAction } from "@App/app/service/service_worker/types";
+import type { TBatchUpdateListAction, TBatchUpdateResult } from "@App/app/service/service_worker/types";
 import type { TOpenBatchUpdatePageOption, TCheckScriptUpdateOption } from "@App/app/service/service_worker/script";
 
 export const scriptClient = new ScriptClient(message);
@@ -21,13 +25,17 @@ export const permissionClient = new PermissionClient(message);
 export const valueClient = new ValueClient(message);
 export const resourceClient = new ResourceClient(message);
 export const synchronizeClient = new SynchronizeClient(message);
+export const agentClient = new AgentClient(message);
+export const logClient = new LogClient(message);
+export const externalAccessClient = new ExternalAccessClient(message);
+export const networkRuleClient = new NetworkRuleClient(message);
 
 export const fetchScriptList = async () => {
   return await scriptClient.getAllScripts();
 };
 
 export const fetchScript = async (uuid: string) => {
-  return await scriptClient.info(uuid);
+  return await scriptClient.findInfo(uuid);
 };
 
 export const requestEnableScript = async (param: { uuid: string; enable: boolean }) => {
@@ -42,19 +50,30 @@ export const requestStopScript = async (uuid: string) => {
   return await runtimeClient.stopScript(uuid);
 };
 
-// export const requestDeleteScript = createAsyncThunk("script/deleteScript", async (uuid: string) => {
-//   return await scriptClient.delete(uuid);
-// });
-
 export const requestDeleteScripts = async (uuids: string[]) => {
   return await scriptClient.deletes(uuids);
 };
 
-export const requestFilterResult = async (req: { type: SearchType; value: string }) => {
+export const requestRestoreScripts = async (uuids: string[]) => {
+  return await scriptClient.restores(uuids);
+};
+
+export const requestPurgeScripts = async (uuids: string[]) => {
+  return await scriptClient.purges(uuids);
+};
+
+export const requestTrashScripts = async () => {
+  return await scriptClient.getTrashScripts();
+};
+
+export const requestFilterResult = async (req: { value: string }) => {
   return await scriptClient.getFilterResult(req);
 };
 
-export const requestBatchUpdateListAction = async (action: TBatchUpdateListAction) => {
+// 只有 UPDATE 动作会回报执行结果；IGNORE 动作无返回值
+export const requestBatchUpdateListAction = async (
+  action: TBatchUpdateListAction
+): Promise<TBatchUpdateResult | undefined> => {
   return await scriptClient.batchUpdateListAction(action);
 };
 
@@ -84,8 +103,8 @@ export type ScriptLoading = Script & {
   code?: string; // 用于搜索的脚本代码
 };
 
-export const sortScript = async ({ active, over }: { active: string; over: string }) => {
-  return await scriptClient.sortScript(active, over);
+export const sortScript = async (data: { before: string[]; after: string[] }) => {
+  return await scriptClient.sortScript(data);
 };
 
 export const pinToTop = async (uuids: string[]) => {

@@ -1,33 +1,26 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App.tsx";
-import { AppProvider } from "../store/AppContext.tsx";
-import MainLayout from "../components/layout/MainLayout.tsx";
 import LoggerCore from "@App/app/logger/core.ts";
 import { message } from "../store/global.ts";
 import MessageWriter from "@App/app/logger/message_writer.ts";
-import "@arco-design/web-react/dist/css/arco.css";
-import "@App/locales/locales";
+import { ThemeProvider } from "../components/theme-provider.tsx";
+import { Toaster } from "../components/ui/sonner.tsx";
 import "@App/index.css";
-import "./index.css";
-import registerEditor from "@App/pkg/utils/monaco-editor";
-
-registerEditor();
 
 // 初始化日志组件
 const loggerCore = new LoggerCore({
-  writer: new MessageWriter(message),
+  writer: MessageWriter.serviceWorker(message),
   labels: { env: "install" },
 });
 
 loggerCore.logger().debug("install page start");
 
 const Root = (
-  <AppProvider>
-    <MainLayout className="!flex-col !px-4 box-border install-main-layout">
-      <App />
-    </MainLayout>
-  </AppProvider>
+  <ThemeProvider>
+    <App />
+    <Toaster placement="decision" />
+  </ThemeProvider>
 );
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

@@ -9,21 +9,29 @@ import {
 } from "@App/app/repo/scripts";
 import type { Server } from "@Packages/message/server";
 import type { WindowMessage } from "@Packages/message/window_message";
-import { CronJob } from "cron";
+import { createCronJob, type CronJob } from "@App/pkg/utils/cron";
 import { proxyUpdateRunStatus } from "../offscreen/client";
 import { BgExecScriptWarp } from "../content/exec_warp";
 import type ExecScript from "../content/exec_script";
-import type { ValueUpdateData, ValueUpdateDataEncoded } from "../content/types";
-import { getStorageName, getMetadataStr, getUserConfigStr } from "@App/pkg/utils/utils";
+import { compileScriptCodeByResource } from "../content/utils";
+import type { ValueUpdateDataEncoded } from "../content/types";
+import { getStorageName, getMetadataStr, getUserConfigStr, getISOWeek } from "@App/pkg/utils/utils";
 import type { EmitEventRequest, ScriptLoadInfo } from "../service_worker/types";
 import { CATRetryError } from "../content/exec_warp";
 import { parseUserConfig } from "@App/pkg/utils/yaml";
-import { decodeMessage } from "@App/pkg/utils/message_value";
+import { decodeRValue } from "@App/pkg/utils/message_value";
+import { extractCronExpr } from "@App/pkg/utils/cron";
+import { changeLanguage, initLanguage, t } from "@App/locales/locales";
+import { type TExtensionEnv } from "../extension/extension_env";
+
+const utime_1min = 60 * 1000;
+const utime_1hr = 60 * 60 * 1000;
+const utime_1day = 24 * 60 * 60 * 1000;
 
 export class Runtime {
   cronJob: Map<string, Array<CronJob>> = new Map();
 
-  execScripts: Map<string, ExecScript> = new Map();
+  execScriptMap: Map<string, ExecScript> = new Map();
 
   logger: Logger;
 
@@ -34,7 +42,8 @@ export class Runtime {
 
   constructor(
     private windowMessage: WindowMessage,
-    private api: Server
+    private api: Server,
+    private readonly extensionEnvAsync: Promise<TExtensionEnv | undefined>
   ) {
     this.logger = LoggerCore.getInstance().logger({ component: "sandbox" });
     // 重试队列,5s检查一次
@@ -81,7 +90,7 @@ export class Runtime {
   async enableScript(script: ScriptRunResource) {
     // 开启脚本
     // 如果正在运行,先释放
-    if (this.execScripts.has(script.uuid)) {
+    if (this.execScriptMap.has(script.uuid)) {
       await this.disableScript(script.uuid);
     }
     const metadataStr = getMetadataStr(script.code) || "";
@@ -112,7 +121,7 @@ export class Runtime {
     }
     // 移除重试队列
     this.removeRetryList(uuid);
-    if (!this.execScripts.has(uuid)) {
+    if (!this.execScriptMap.has(uuid)) {
       // 没有在运行
       return false;
     }
@@ -121,15 +130,68 @@ export class Runtime {
   }
 
   // 执行脚本
-  async execScript(script: ScriptLoadInfo, execOnce?: boolean) {
+  async execScript(
+    script: ScriptLoadInfo,
+    opts?: {
+      execOnce?: boolean;
+      cronJobOncePos?: number;
+    }
+  ) {
+    const execOnce = opts?.execOnce ?? false;
+    const cronJobOncePos = opts?.cronJobOncePos ?? 0;
+
+    if (cronJobOncePos >= 1) {
+      // 没有最后一次执行时间表示之前都没执行过,直接执行
+      if (script.lastruntime) {
+        const now = new Date();
+        const last = new Date(script.lastruntime);
+        // 根据once所在的位置去判断执行
+        const timeDiff = now.getTime() - last.getTime();
+        switch (cronJobOncePos) {
+          case 1: // 每分钟
+            if (timeDiff < 2 * utime_1min && last.getMinutes() === now.getMinutes()) return;
+            break;
+          case 2: // 每小时
+            if (timeDiff < 2 * utime_1hr && last.getHours() === now.getHours()) return;
+            break;
+          case 3: // 每天
+            if (timeDiff < 2 * utime_1day && last.getDay() === now.getDay()) return;
+            break;
+          case 4: // 每月
+            if (timeDiff < 62 * utime_1day && last.getMonth() === now.getMonth()) return;
+            break;
+          case 5: // 每周
+            if (timeDiff < 14 * utime_1day && getISOWeek(last) === getISOWeek(now)) return;
+            break;
+          default:
+        }
+      }
+    }
+
     const logger = this.logger.with({ uuid: script.uuid, name: script.name });
-    if (this.execScripts.has(script.uuid)) {
+    if (this.execScriptMap.has(script.uuid)) {
       // 释放掉资源
       // 暂未实现执行完成后立马释放,会在下一次执行时释放
       await this.stopScript(script.uuid);
     }
-    const exec = new BgExecScriptWarp(script, this.windowMessage);
-    this.execScripts.set(script.uuid, exec);
+    const extensionEnv = await this.extensionEnvAsync;
+
+    // 判断 run-in
+    const runIn = script.metadata?.["run-in"]?.[0];
+    const inIncognitoContext = extensionEnv?.inIncognitoContext;
+    // Firefox spanning 只有一个共享 event page / sandbox，没有按普通窗口与隐身窗口拆分的后台环境。
+    // 因此后台/定时脚本只能运行一次；tab 专属的 run-in 值在该共享环境中不做伪隔离。
+    const hasPerContextBackground = extensionEnv?.incognitoMode !== "spanning";
+    if (hasPerContextBackground && runIn && runIn !== "all" && typeof inIncognitoContext === "boolean") {
+      // 判断插件运行环境
+      const contextType = inIncognitoContext ? "incognito-tabs" : "normal-tabs";
+      if (runIn !== contextType) {
+        return;
+      }
+    }
+
+    const exec = new BgExecScriptWarp(script, this.windowMessage, extensionEnv);
+    this.execScriptMap.set(script.uuid, exec);
     proxyUpdateRunStatus(this.windowMessage, { uuid: script.uuid, runStatus: SCRIPT_RUN_STATUS_RUNNING });
     // 修改掉脚本掉最后运行时间, 数据库也需要修改
     script.lastruntime = Date.now();
@@ -181,104 +243,62 @@ export class Runtime {
   crontabScript(script: ScriptLoadInfo) {
     // 执行定时脚本 运行表达式
     if (!script.metadata.crontab) {
-      throw new Error(script.name + " - 错误的crontab表达式");
+      throw new Error(script.name + " - " + t("script:cron_invalid_expr"));
     }
     // 如果有nextruntime,则加入重试队列
     this.joinRetryList(script);
     this.crontabSripts.push(script);
-    let flag = false;
+
+    const ERROR_MESSAGES: Record<number, string> = {
+      0: "crontabScript: cron expression failed",
+      2: "crontabScript: onTick creation failed",
+      4: "crontabScript: create cronjob failed",
+      6: "crontabScript: cronjob start failed",
+    };
+
+    const logError = (ok: number, val: string, e: unknown) =>
+      this.logger.error(
+        ERROR_MESSAGES[ok] ?? "crontabScript: execution failed",
+        { uuid: script.uuid, crontab: val },
+        Logger.E(e)
+      );
+
     const cronJobList: Array<CronJob> = [];
     script.metadata.crontab.forEach((val) => {
-      let oncePos = 0;
-      let crontab = val;
-      if (crontab.includes("once")) {
-        const vals = crontab.split(" ");
-        vals.forEach((item, index) => {
-          if (item === "once") {
-            oncePos = index;
-          }
-        });
-        if (vals.length === 5) {
-          oncePos += 1;
-        }
-        crontab = crontab.replace(/once/g, "*");
-      }
+      let ok = 0;
       try {
-        const cron = new CronJob(crontab, this.crontabExec(script, oncePos));
+        const { cronExpr, oncePos } = extractCronExpr(val);
+        ok = 2;
+        const onTick = this.crontabExec(script, oncePos);
+        ok = 4;
+        const cron = createCronJob({
+          cronTime: cronExpr,
+          onTick,
+          start: false, // 不使用 start: true。下面手动执行。
+        });
+        ok = 6;
         cron.start();
+        ok = 8;
         cronJobList.push(cron);
       } catch (e) {
-        flag = true;
-        this.logger.error(
-          "create cronjob failed",
-          {
-            uuid: script.uuid,
-            crontab: val,
-          },
-          Logger.E(e)
-        );
+        logError(ok, val, e);
       }
     });
-    if (cronJobList.length !== script.metadata.crontab.length) {
+
+    const allSucceeded = cronJobList.length === script.metadata.crontab.length;
+    if (allSucceeded) {
+      this.cronJob.set(script.uuid, cronJobList);
+    } else {
       // 有表达式失败了
       for (const crontab of cronJobList) {
         crontab.stop();
       }
-    } else {
-      this.cronJob.set(script.uuid, cronJobList);
     }
-    return !flag;
+    return allSucceeded;
   }
 
   crontabExec(script: ScriptLoadInfo, oncePos: number) {
-    if (oncePos) {
-      return () => {
-        // 没有最后一次执行时间表示之前都没执行过,直接执行
-        if (!script.lastruntime) {
-          this.execScript(script);
-          return;
-        }
-        const now = new Date();
-        const last = new Date(script.lastruntime);
-        let flag = false;
-        // 根据once所在的位置去判断执行
-        switch (oncePos) {
-          case 1: // 每分钟
-            flag = last.getMinutes() !== now.getMinutes();
-            break;
-          case 2: // 每小时
-            flag = last.getHours() !== now.getHours();
-            break;
-          case 3: // 每天
-            flag = last.getDay() !== now.getDay();
-            break;
-          case 4: // 每月
-            flag = last.getMonth() !== now.getMonth();
-            break;
-          case 5: // 每周
-            flag = this.getWeek(last) !== this.getWeek(now);
-            break;
-          default:
-        }
-        if (flag) {
-          this.execScript(script);
-        }
-      };
-    }
-    return () => {
-      this.execScript(script);
-    };
-  }
-
-  // 获取本周是第几周
-  getWeek(date: Date) {
-    const nowDate = new Date(date);
-    const firstDay = new Date(date);
-    firstDay.setMonth(0); // 设置1月
-    firstDay.setDate(1); // 设置1号
-    const diffDays = Math.ceil((nowDate.getTime() - firstDay.getTime()) / (24 * 60 * 60 * 1000));
-    const week = Math.ceil(diffDays / 7);
-    return week === 0 ? 1 : week;
+    return this.execScript.bind(this, script, { cronJobOncePos: oncePos });
   }
 
   // 停止计时器
@@ -294,19 +314,19 @@ export class Runtime {
   }
 
   async stopScript(uuid: string) {
-    const exec = this.execScripts.get(uuid);
+    const exec = this.execScriptMap.get(uuid);
     if (!exec) {
       proxyUpdateRunStatus(this.windowMessage, { uuid: uuid, runStatus: SCRIPT_RUN_STATUS_COMPLETE });
       return false;
     }
     exec.stop();
-    this.execScripts.delete(uuid);
+    this.execScriptMap.delete(uuid);
     proxyUpdateRunStatus(this.windowMessage, { uuid: uuid, runStatus: SCRIPT_RUN_STATUS_COMPLETE });
     return true;
   }
 
   async runScript(script: ScriptRunResource) {
-    const exec = this.execScripts.get(script.uuid);
+    const exec = this.execScriptMap.get(script.uuid);
     // 如果正在运行,先释放
     if (exec) {
       await this.stopScript(script.uuid);
@@ -320,13 +340,14 @@ export class Runtime {
       userConfigStr,
       userConfig,
     } as ScriptLoadInfo;
-    return this.execScript(loadScript, true);
+    return this.execScript(loadScript, { execOnce: true });
   }
 
   valueUpdate(data: ValueUpdateDataEncoded) {
-    const dataNew = { ...data, entries: decodeMessage(data.entries) } as ValueUpdateData;
+    // runtime/valueUpdate
+    const dataEntries = data.entries;
     // 转发给脚本
-    this.execScripts.forEach((val) => {
+    this.execScriptMap.forEach((val) => {
       if (val.scriptRes.uuid === data.uuid || getStorageName(val.scriptRes) === data.storageName) {
         val.valueUpdate(data);
       }
@@ -334,7 +355,8 @@ export class Runtime {
     // 更新crontabScripts中的脚本值
     for (const script of this.crontabSripts) {
       if (script.uuid === data.uuid || getStorageName(script) === data.storageName) {
-        for (const [key, value, _oldValue] of dataNew.entries) {
+        for (const [key, rTyped1, _rTyped2] of dataEntries) {
+          const value = decodeRValue(rTyped1);
           script.value[key] = value;
         }
       }
@@ -343,10 +365,14 @@ export class Runtime {
 
   emitEvent(data: EmitEventRequest) {
     // 转发给脚本
-    const exec = this.execScripts.get(data.uuid);
+    const exec = this.execScriptMap.get(data.uuid);
     if (exec) {
       exec.emitEvent(data.event, data.eventId, data.data);
     }
+  }
+
+  setSandboxLanguage(lang: string) {
+    changeLanguage(lang);
   }
 
   init() {
@@ -357,5 +383,70 @@ export class Runtime {
 
     this.api.on("runtime/valueUpdate", this.valueUpdate.bind(this));
     this.api.on("runtime/emitEvent", this.emitEvent.bind(this));
+    this.api.on("setSandboxLanguage", this.setSandboxLanguage.bind(this));
+    this.api.on("executeSkillScript", this.executeSkillScript.bind(this));
+    initLanguage();
+  }
+
+  // 执行 Skill Script：构建最小化脚本上下文，注入 args，执行并返回结果
+  async executeSkillScript(params: {
+    uuid: string;
+    code: string;
+    args: Record<string, unknown>;
+    grants: string[];
+    name: string;
+    requires?: Array<{ url: string; content: string }>;
+    configValues?: Record<string, unknown>;
+  }): Promise<unknown> {
+    const uuid = params.uuid;
+    const metadata: any = {
+      grant: params.grants,
+    };
+    // 通过 compileScriptCodeByResource 包裹代码，加上 with(arguments[0]||this.$) 等上下文绑定，
+    // 使脚本能访问 sandboxContext 上注入的变量（args、GM API 等）
+    const compiledCode = compileScriptCodeByResource({
+      name: params.name,
+      code: params.code,
+      require: params.requires || [],
+      isContextMenu: false,
+    });
+
+    // 构造最小化的 ScriptLoadInfo
+    const scriptLoadInfo = {
+      uuid,
+      name: params.name,
+      namespace: "",
+      type: SCRIPT_TYPE_BACKGROUND,
+      status: 1,
+      sort: 0,
+      runStatus: "complete" as const,
+      createtime: Date.now(),
+      checktime: 0,
+      code: compiledCode,
+      value: {},
+      flag: "",
+      resource: {},
+      metadata,
+      originalMetadata: metadata,
+      metadataStr: "",
+      userConfigStr: "",
+    } as ScriptLoadInfo;
+
+    // 使用 BgExecScriptWarp 执行，它会自动构建 setTimeout/setInterval 等
+    const extensionEnv = await this.extensionEnvAsync;
+    const exec = new BgExecScriptWarp(scriptLoadInfo, this.windowMessage, extensionEnv);
+    // 通过 sandboxContext 注入 args（BgExecScriptWarp 通过 globalInjection 注入了 setTimeout 等，
+    // sandboxContext 已经包含了这些，再追加 args 即可）
+    if ((exec as any).sandboxContext) {
+      (exec as any).sandboxContext.args = params.args;
+      (exec as any).sandboxContext.CAT_CONFIG = Object.freeze(params.configValues || {});
+    }
+
+    try {
+      const result = await exec.exec();
+      return result;
+    } finally {
+      exec.stop();
+    }
   }
 }

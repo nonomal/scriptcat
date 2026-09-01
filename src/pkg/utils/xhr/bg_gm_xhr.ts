@@ -1,9 +1,11 @@
-import type { GMXhrStrategy } from "@App/app/service/service_worker/gm_api/gm_xhr";
+import { type GMXhrStrategy } from "@App/app/service/service_worker/gm_api/gm_xhr";
 import { stackAsyncTask } from "@App/pkg/utils/async_queue";
 import { chunkUint8, uint8ToBase64 } from "@App/pkg/utils/datatype";
 import type { MessageConnect, TMessageCommAction } from "@Packages/message/types";
 import { dataDecode } from "./xhr_data";
 import { FetchXHR } from "./fetch_xhr";
+import { normalizeResponseHeaders } from "../utils";
+import { gmXhrRequestLinker } from "@App/app/service/service_worker/gm_api/mv3_utils";
 
 export type RequestResultParams = {
   statusCode: number;
@@ -146,13 +148,14 @@ export class BgGMXhr {
     private details: GMSend.XHRDetails,
     private resultParams: RequestResultParams,
     private msgConn: MessageConnect,
-    private strategy?: GMXhrStrategy
+    private strategy: GMXhrStrategy | null,
+    private readonly markerID: string
   ) {
-    this.taskId = `${Date.now}:${Math.random()}`;
+    this.taskId = `${Date.now()}:${Math.random()}`;
     this.isConnDisconnected = false;
   }
 
-  onDataReceived(param: { chunk: boolean; type: string; data: any }) {
+  private readonly onDataReceived = (param: { chunk: boolean; type: string; data: any }) => {
     stackAsyncTask(this.taskId, async () => {
       if (this.isConnDisconnected) return;
       try {
@@ -210,7 +213,7 @@ export class BgGMXhr {
         console.error(e);
       }
     });
-  }
+  };
 
   callback(result: BgGMXhrCallbackResult) {
     const data = {
@@ -265,7 +268,7 @@ export class BgGMXhr {
       let rawData = (details.data = await details.data);
 
       const baseXHR = useFetch
-        ? new FetchXHR(isBufferStream, this.onDataReceived.bind(this), (opts: RequestInit) => {
+        ? new FetchXHR(isBufferStream, this.onDataReceived, (opts: RequestInit) => {
             if (redirect) {
               opts.redirect = redirect;
             }
@@ -282,110 +285,114 @@ export class BgGMXhr {
           })
         : new XMLHttpRequest();
 
-      this.abort = () => {
-        baseXHR.abort();
-      };
+      this.abort = baseXHR.abort.bind(baseXHR);
 
       const url = details.url;
       if (details.overrideMimeType) {
         baseXHR.overrideMimeType(details.overrideMimeType);
       }
 
-      let contentType = "";
-      let responseHeaders: string | null = null;
-      let finalStateChangeEvent: XHREvent | null = null;
-      let canTriggerFinalStateChangeEvent = false;
-      const callback = (evt: XHREvent, err?: Error | string) => {
-        const xhr = baseXHR;
-        const eventType = evt.type;
-        const isProgressEvt = isProgressEvent(evt);
-
-        if (eventType === "load") {
-          canTriggerFinalStateChangeEvent = true;
-          if (finalStateChangeEvent) callback(finalStateChangeEvent);
-        } else if (eventType === "readystatechange" && xhr.readyState === 4) {
-          // readyState4 的readystatechange或会重复，见 https://github.com/violentmonkey/violentmonkey/issues/1862
-          if (!canTriggerFinalStateChangeEvent) {
-            finalStateChangeEvent = evt;
+      {
+        const localThis = baseXHR;
+        let contentType = "";
+        let responseHeaders: string | null = null;
+        let finalStateChangeEvent: XHREvent | null = null;
+        let canTriggerFinalStateChangeEvent = false;
+        const callback = (evt: XHREvent, err?: Error | string) => {
+          const xhr = localThis;
+          const eventType = evt.type;
+          // 对齐 TM 的实现：不处理 readyState 从 0 到 1 和 2 到 3 的 onreadystatechange 事件。
+          if (useFetch && eventType === "readystatechange" && (xhr.readyState === 1 || xhr.readyState === 3)) {
             return;
           }
-        }
-        canTriggerFinalStateChangeEvent = false;
-        finalStateChangeEvent = null;
+          const isProgressEvt = isProgressEvent(evt);
 
-        // contentType 和 responseHeaders 只读一次
-        contentType = contentType || xhr.getResponseHeader("Content-Type") || "";
-        if (contentType && !responseHeaders) {
-          responseHeaders = xhr.getAllResponseHeaders();
-        }
-        if (!(xhr instanceof FetchXHR)) {
-          const response = xhr.response;
-          if (xhr.readyState === 4 && eventType === "readystatechange") {
-            if (xhrResponseType === "" || xhrResponseType === "text") {
-              this.onDataReceived({ chunk: false, type: "text", data: xhr.responseText });
-            } else if (xhrResponseType === "arraybuffer" && response instanceof ArrayBuffer) {
-              this.onDataReceived({ chunk: false, type: "arraybuffer", data: response });
+          if (eventType === "load") {
+            canTriggerFinalStateChangeEvent = true;
+            if (finalStateChangeEvent) callback(finalStateChangeEvent);
+          } else if (eventType === "readystatechange" && xhr.readyState === 4) {
+            // readyState4 的readystatechange或会重复，见 https://github.com/violentmonkey/violentmonkey/issues/1862
+            if (!canTriggerFinalStateChangeEvent) {
+              finalStateChangeEvent = evt;
+              return;
             }
           }
-        }
+          canTriggerFinalStateChangeEvent = false;
+          finalStateChangeEvent = null;
 
-        const result: BgGMXhrCallbackResult = {
-          /*
-        
-        
-          finalUrl: string; // sw handle
-          readyState: 0 | 4 | 2 | 3 | 1;
-          status: number;
-          statusText: string;
-          responseHeaders: string;
-          error?: string; // sw handle?
+          // contentType 和 responseHeaders 只读一次
+          contentType = contentType || xhr.getResponseHeader("Content-Type") || "";
+          if (contentType && !responseHeaders) {
+            // TM兼容: 原生xhr有 \r\n 在尾，但TM的GMXhr没有；同时除去冒号后面的空白
+            responseHeaders = normalizeResponseHeaders(xhr.getAllResponseHeaders());
+          }
+          if (!(xhr instanceof FetchXHR)) {
+            const response = xhr.response;
+            if (xhr.readyState === 4 && eventType === "readystatechange") {
+              if (xhrResponseType === "" || xhrResponseType === "text") {
+                this.onDataReceived({ chunk: false, type: "text", data: xhr.responseText });
+              } else if (xhrResponseType === "arraybuffer" && response instanceof ArrayBuffer) {
+                this.onDataReceived({ chunk: false, type: "arraybuffer", data: response });
+              }
+            }
+          }
 
-          useFetch: boolean,
-          eventType: string,
-          ok: boolean,
-          contentType: string,
-          error: undefined | string,
+          const result: BgGMXhrCallbackResult = {
+            /*
+          
+          
+            finalUrl: string; // sw handle
+            readyState: 0 | 4 | 2 | 3 | 1;
+            status: number;
+            statusText: string;
+            responseHeaders: string;
+            error?: string; // sw handle?
+  
+            useFetch: boolean,
+            eventType: string,
+            ok: boolean,
+            contentType: string,
+            error: undefined | string,
+  
+          */
 
-        */
+            useFetch: useFetch,
+            eventType: eventType,
+            ok: xhr.status >= 200 && xhr.status < 300,
+            contentType,
+            // Always
+            readyState: xhr.readyState as GMTypes.ReadyState,
+            // After response headers
+            status: xhr.status,
+            statusText: xhr.statusText,
+            // After load
+            // response: response,
+            // responseText: responseText,
+            // responseXML: responseXML,
+            // After headers received
+            responseHeaders: responseHeaders,
+            responseURL: xhr.responseURL,
+            // How to get the error message in native XHR ?
+            error: eventType !== "error" ? undefined : (err as Error)?.message || err || "Unknown Error",
+          } satisfies BgGMXhrCallbackResult;
 
-          useFetch: useFetch,
-          eventType: eventType,
-          ok: xhr.status >= 200 && xhr.status < 300,
-          contentType,
-          // Always
-          readyState: xhr.readyState as GMTypes.ReadyState,
-          // After response headers
-          status: xhr.status,
-          statusText: xhr.statusText,
-          // After load
-          // response: response,
-          // responseText: responseText,
-          // responseXML: responseXML,
-          // After headers received
-          responseHeaders: responseHeaders,
-          responseURL: xhr.responseURL,
-          // How to get the error message in native XHR ?
-          error: eventType !== "error" ? undefined : (err as Error)?.message || err || "Unknown Error",
-        } satisfies BgGMXhrCallbackResult;
+          if (isProgressEvt) {
+            result.total = evt.total;
+            result.loaded = evt.loaded;
+            result.lengthComputable = evt.lengthComputable;
+          }
 
-        if (isProgressEvt) {
-          result.total = evt.total;
-          result.loaded = evt.loaded;
-          result.lengthComputable = evt.lengthComputable;
-        }
-
-        this.callback(result);
-
-        evt.type;
-      };
-      baseXHR.onabort = callback;
-      baseXHR.onloadstart = callback;
-      baseXHR.onload = callback;
-      baseXHR.onerror = callback;
-      baseXHR.onprogress = callback;
-      baseXHR.ontimeout = callback;
-      baseXHR.onreadystatechange = callback;
-      baseXHR.onloadend = callback;
+          this.callback(result);
+        };
+        baseXHR.onabort = callback;
+        baseXHR.onloadstart = callback;
+        baseXHR.onload = callback;
+        baseXHR.onerror = callback;
+        baseXHR.onprogress = callback;
+        baseXHR.ontimeout = callback;
+        baseXHR.onreadystatechange = callback;
+        baseXHR.onloadend = callback;
+      }
 
       baseXHR.open(details.method ?? "GET", url, true, details.user, details.password);
 
@@ -397,7 +404,7 @@ export class BgGMXhr {
       }
       // "" | "arraybuffer" | "blob" | "document" | "json" | "text"
       if (details.responseType === "json") {
-        // 故意忽略，json -> text，兼容TM
+        // 故意忽略，json -> text，TM兼容
       } else if (details.responseType === "stream") {
         xhrResponseType = baseXHR.responseType = "arraybuffer";
       } else if (details.responseType) {
@@ -471,22 +478,23 @@ export class BgGMXhr {
         rawData = new Blob([rawData], { type: "application/octet-stream" });
       }
 
-      // Send data (if any)
-      baseXHR.send(rawData ?? null);
+      await gmXhrRequestLinker.send(baseXHR, rawData ?? null, { markerID: this.markerID, url });
     };
 
     await prepareXHR();
   }
+
+  private readonly handleDisconnect = () => {
+    this.isConnDisconnected = true;
+    this.abort?.();
+    // console.warn("msgConn.onDisconnect");
+  };
 
   do() {
     this.bgXhrRequestFn().catch((e: any) => {
       this.abort?.();
       console.error(e);
     });
-    this.msgConn.onDisconnect(() => {
-      this.isConnDisconnected = true;
-      this.abort?.();
-      // console.warn("msgConn.onDisconnect");
-    });
+    this.msgConn.onDisconnect(this.handleDisconnect);
   }
 }

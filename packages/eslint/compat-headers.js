@@ -16,6 +16,8 @@ const compatMap = {
     scriptUrl: [],
     storageName: [],
     "early-start": [],
+    "require-css": [],
+    allFrames: [],
   },
 };
 

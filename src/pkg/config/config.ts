@@ -7,6 +7,8 @@ import { matchLanguage } from "@App/locales/locales";
 import { ExtVersion } from "@App/app/const";
 import defaultTypeDefinition from "@App/template/scriptcat.d.tpl";
 import { toCamelCase } from "../utils/utils";
+import EventEmitter from "eventemitter3";
+import { STORAGE_LOCAL_KEYS } from "./consts";
 
 export const SystemConfigChange = "systemConfigChange";
 
@@ -18,10 +20,56 @@ export type CloudSyncConfig = {
   params: { [key: string]: any };
 };
 
+// 云同步运行状态（设备本地，非用户配置）：供设置页「脚本同步」卡片顶部状态条展示。
+// 由 SynchronizeService 每轮同步写入本地存储（ChromeStorage "sync" 命名空间），页面读取并订阅 chrome.storage 变更。
+export type CloudSyncState = {
+  syncing: boolean;
+  lastSyncAt: number; // ms，从未同步为 0
+  error?: string; // 最近一次同步失败原因（如账号验证失败）
+  counts: { total: number; overwrite: number; conflict: number; failed: number };
+};
+
+export const CLOUD_SYNC_STATE_KEY = "cloud_sync_state";
+
+export const DEFAULT_CLOUD_SYNC_STATE: CloudSyncState = {
+  syncing: false,
+  lastSyncAt: 0,
+  counts: { total: 0, overwrite: 0, conflict: 0, failed: 0 },
+};
+
+// "none" 表示彻底关闭网站图标获取：不向任何图标服务或目标站点发起请求
+export type FaviconService = "none" | "scriptcat" | "google" | "duckduckgo" | "icon-horse" | "local";
+
+// 外部接入 · 每类操作的人机闸门策略：需人工审批（默认）/ 直接允许。写操作与源码读取各持一份，
+// 对 CLI 与 MCP 一视同仁（源码读取不再对 CLI 豁免）。
+export type ExternalAccessWritePolicy = "approval" | "allow";
+export type ExternalAccessSourceReadPolicy = "approval" | "allow";
+
+// MCP 配对成功后落地的长期共享密钥 K（小写 hex）与本扩展实例的客户端身份。
+// key 为空串表示尚未配对。仅存 chrome.storage.local，绝不跨设备同步。
+export type ExternalAccessPairing = {
+  key: string;
+  clientId: string;
+};
+
 export type CATFileStorage = {
   filesystem: FileSystemType;
   params: { [key: string]: any };
   status: "unset" | "success" | "error";
+};
+
+export type EditorPreferences = {
+  version: 1;
+  fontSize: number;
+  mouseWheelScrollSensitivity: number;
+  smoothScrolling: boolean;
+};
+
+export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
+  version: 1,
+  fontSize: 14,
+  mouseWheelScrollSensitivity: 1,
+  smoothScrolling: true,
 };
 
 type WithAsyncValue<T> = T | { asyncValue?: () => Promise<T> };
@@ -69,99 +117,247 @@ export type SystemConfigValueType<K extends SystemConfigKey> =
         : never
     : never;
 
-export class SystemConfig {
-  private readonly cache = new Map<string, any>();
+interface ISystemConfigExternalStore<K extends SystemConfigKey> {
+  subscribe: (listener: () => void) => () => void;
+  getSnapshot: () => SystemConfigValueType<K> | undefined;
+  set: (value: SystemConfigValueType<K>) => void;
+}
 
-  private readonly storage = new ChromeStorage("system", true);
+class SystemConfigExternalStore<K extends SystemConfigKey> implements ISystemConfigExternalStore<K> {
+  private value: SystemConfigValueType<K> | undefined;
+  private unsubscribeConfig: (() => void) | undefined;
+
+  constructor(
+    private readonly config: SystemConfig,
+    private readonly key: K,
+    private readonly events: EventEmitter<SystemConfigKey>
+  ) {}
+
+  readonly getSnapshot = () => this.value;
+
+  readonly subscribe = (listener: () => void) => {
+    this.events.on(this.key, listener);
+    if (this.events.listenerCount(this.key) === 1) {
+      this.unsubscribeConfig = this.config.watch(this.key, this.update);
+    }
+    return () => {
+      this.events.off(this.key, listener);
+      if (this.events.listenerCount(this.key) === 0) {
+        this.unsubscribeConfig?.();
+        this.unsubscribeConfig = undefined;
+        this.value = undefined;
+      }
+    };
+  };
+
+  readonly set = (value: SystemConfigValueType<K>) => {
+    this.update(value);
+    this.config.set(this.key, value);
+  };
+
+  private readonly update = (value: SystemConfigValueType<K>) => {
+    if (Object.is(this.value, value)) return;
+    this.value = value;
+    this.events.emit(this.key);
+  };
+}
+
+interface SystemConfigEntry {
+  hasValue: boolean;
+  value: unknown;
+  version: number;
+  pendingWrite?: Promise<void>;
+  store?: unknown;
+}
+
+type GetterFn<T extends SystemConfigKey> = (
+  ...args: any[]
+) => Promise<SystemConfigValueType<T>> | SystemConfigValueType<T>;
+
+type SetterFn<T extends SystemConfigKey> = (value: SystemConfigValueType<T>) => unknown;
+
+type TGetterKey<T extends SystemConfigKey = SystemConfigKey> = Extract<
+  `get${Capitalize<SnakeToCamel<T>>}`,
+  keyof SystemConfig
+>;
+
+type TSetterKey<T extends SystemConfigKey = SystemConfigKey> = Extract<
+  `set${Capitalize<SnakeToCamel<T>>}`,
+  keyof SystemConfig
+>;
+
+export class SystemConfig {
+  private readonly cache = new Map<string, SystemConfigEntry>();
+  private readonly storeEvents = new EventEmitter<SystemConfigKey>();
+
+  // 跨设备同步的配置项，使用 chrome.storage.sync
+  private readonly syncStorage = new ChromeStorage("system", true);
+  // 设备相关的配置项，使用 chrome.storage.local（不跨设备同步）
+  private readonly localStorage = new ChromeStorage("system", false);
+
+  private isLocalKey(key: string): boolean {
+    return STORAGE_LOCAL_KEYS.has(key);
+  }
+
+  // 获取 key 对应的主 storage
+  private getStorage(key: string): ChromeStorage {
+    return this.isLocalKey(key) ? this.localStorage : this.syncStorage;
+  }
+
+  private readonly EE: EventEmitter<SystemConfigKey> = new EventEmitter<SystemConfigKey>();
 
   constructor(private mq: IMessageQueue) {
-    this.mq.subscribe<TKeyValue>(SystemConfigChange, ({ key, value }) => {
-      this.cache.set(key, value);
+    this.mq.subscribe<TKeyValue<SystemConfigKey>>(SystemConfigChange, ({ key, value, prev }) => {
+      // 更新缓存
+      const entry = this.cacheEntry(key);
+      entry.hasValue = true;
+      entry.value = value;
+      entry.version += 1;
+      // 触发事件
+      this.EE.emit(key, value, prev);
     });
   }
 
-  addListener(key: string, callback: (value: any) => void) {
-    this.mq.subscribe<TKeyValue>(SystemConfigChange, (data) => {
-      if (data.key === key) {
-        callback(data.value);
-      }
+  private cacheEntry(key: string) {
+    let entry = this.cache.get(key);
+    if (!entry) {
+      entry = { hasValue: false, value: undefined, version: 0 };
+      this.cache.set(key, entry);
+    }
+    return entry;
+  }
+
+  public externalStore<T extends SystemConfigKey>(key: T): ISystemConfigExternalStore<T> {
+    const entry = this.cacheEntry(key);
+    const existing = entry.store as ISystemConfigExternalStore<T> | undefined;
+    if (existing) return existing;
+    const store = new SystemConfigExternalStore(this, key, this.storeEvents);
+    entry.store = store;
+    return store;
+  }
+
+  // 添加配置变更监听
+  addListener<T extends SystemConfigKey>(
+    key: T,
+    callback: (value: SystemConfigValueType<T>, prev: SystemConfigValueType<T> | undefined) => void
+  ) {
+    this.EE.on(key, callback);
+    return this.EE.off.bind(this.EE, key, callback) as () => void;
+  }
+
+  // 监听配置变更，会使用设置值立即执行一次回调
+  watch<T extends SystemConfigKey>(
+    key: T,
+    callback: (value: SystemConfigValueType<T>, prev: SystemConfigValueType<T> | undefined) => void
+  ) {
+    // 立即执行一次
+    Promise.resolve(this.get(key)).then((val) => {
+      callback(val, undefined);
     });
+    // 监听变更
+    return this.addListener(key, callback);
+  }
+
+  private resolveDefault<T>(defaultValue: WithAsyncValue<Exclude<T, undefined>>): T | Promise<T> {
+    const asyncFactory =
+      typeof defaultValue === "object" && defaultValue !== null
+        ? (defaultValue as { asyncValue?: () => Promise<T> }).asyncValue
+        : undefined;
+    return (asyncFactory?.() ?? defaultValue) as T | Promise<T>;
+  }
+
+  private async transferSyncToLocal<T>(
+    key: SystemConfigKey,
+    defaultValue: WithAsyncValue<Exclude<T, undefined>>
+  ): Promise<T> {
+    const syncVal = await this.syncStorage.get(key);
+    if (syncVal === undefined) {
+      const entry = this.cacheEntry(key);
+      entry.hasValue = true;
+      entry.value = undefined;
+      return this.resolveDefault<T>(defaultValue);
+    }
+    // 迁移到 local storage 并从 sync 中删除
+    await this.syncStorage.remove(key); // 先删除
+    await this.localStorage.set(key, syncVal); // 删除成功后储回本地
+    const entry = this.cacheEntry(key);
+    entry.hasValue = true;
+    entry.value = syncVal;
+    return syncVal as T;
   }
 
   private _get<T extends string | number | boolean | object>(
     key: SystemConfigKey,
     defaultValue: WithAsyncValue<Exclude<T, undefined>>
   ): Promise<T> {
-    if (this.cache.has(key)) {
-      let val = this.cache.get(key);
-      //@ts-ignore
-      val = (val === undefined ? defaultValue?.asyncValue?.() || defaultValue : val) as T | Promise<T>;
-      return Promise.resolve(val);
+    const entry = this.cacheEntry(key);
+    if (entry.hasValue) {
+      const val = entry.value;
+      return Promise.resolve(val === undefined ? this.resolveDefault<T>(defaultValue) : (val as T));
     }
-    return this.storage.get(key).then((val) => {
-      this.cache.set(key, val);
-      //@ts-ignore
-      val = (val === undefined ? defaultValue?.asyncValue?.() || defaultValue : val) as T | Promise<T>;
-      return val;
+    const version = entry.version;
+    const storage = this.getStorage(key);
+    return storage.get(key).then((val) => {
+      if (version !== entry.version) {
+        return entry.hasValue && entry.value !== undefined ? (entry.value as T) : this.resolveDefault<T>(defaultValue);
+      }
+      if (val !== undefined) {
+        entry.hasValue = true;
+        entry.value = val;
+        return val as T;
+      }
+      // 对 local key，回退读取 sync storage（兼容旧版本数据迁移）
+      if (this.isLocalKey(key)) {
+        return this.transferSyncToLocal<T>(key, defaultValue);
+      }
+      entry.hasValue = true;
+      entry.value = val;
+      return this.resolveDefault<T>(defaultValue);
     });
   }
 
-  public get(key: SystemConfigKey | SystemConfigKey[]): Promise<any | any[]> {
-    if (Array.isArray(key)) {
-      const promises = key.map((key) => {
-        const funcName = `get${toCamelCase(key)}`;
-        // @ts-ignore
-        if (typeof this[funcName] === "function") {
-          // @ts-ignore
-          return this[funcName]() as Promise<any>;
-        } else {
-          throw new Error(`Method ${funcName} does not exist on SystemConfig`);
-        }
-      });
-      return Promise.all(promises);
-    }
-    const funcName = `get${toCamelCase(key)}`;
-    // @ts-ignore
-    if (typeof this[funcName] === "function") {
-      // @ts-ignore
-      return this[funcName]() as Promise<any>;
-    } else {
-      throw new Error(`Method ${funcName} does not exist on SystemConfig`);
-    }
+  public get<T extends SystemConfigKey>(key: T): Promise<SystemConfigValueType<T>> | SystemConfigValueType<T> {
+    const funcName = `get${toCamelCase(key)}` as TGetterKey<T>;
+    if (typeof this[funcName] !== "function") throw new Error(`Method ${funcName} does not exist on SystemConfig`);
+    return (this[funcName] as GetterFn<T>)();
   }
 
-  public set(key: SystemConfigKey, value: any): void {
-    const funcName = `set${toCamelCase(key)}`;
-    // @ts-ignore
-    if (typeof this[funcName] === "function") {
-      // @ts-ignore
-      this[funcName](value);
-    } else {
-      throw new Error(`Method ${funcName} does not exist on SystemConfig`);
-    }
+  public set<T extends SystemConfigKey>(key: T, value: SystemConfigValueType<T>): void {
+    const funcName = `set${toCamelCase(key)}` as TSetterKey<T>;
+    if (typeof this[funcName] !== "function") throw new Error(`Method ${funcName} does not exist on SystemConfig`);
+    (this[funcName] as SetterFn<T>)(value);
   }
 
-  private _set(key: SystemConfigKey, value: any) {
+  private _set<T extends SystemConfigKey>(key: T, value: SystemConfigValueType<T> | undefined) {
+    const entry = this.cacheEntry(key);
+    const prev = entry.value as SystemConfigValueType<T> | undefined;
+    entry.version += 1;
+    const writeVersion = entry.version;
+    const storage = this.getStorage(key);
+    const persist = () => (value === undefined ? storage.remove(key) : storage.set(key, value));
     if (value === undefined) {
-      this.cache.delete(key);
-      this.storage.remove(key);
+      entry.hasValue = true;
+      entry.value = undefined;
     } else {
-      this.cache.set(key, value);
-      this.storage.set(key, value);
+      entry.hasValue = true;
+      entry.value = value;
     }
-    // 发送消息通知更新
-    this.mq.publish<TKeyValue>(SystemConfigChange, {
-      key,
-      value,
+    // 同一配置键可能在输入框逐字编辑时被高频写入。chrome.storage 的异步回调
+    // 不保证多次并发写入按调用顺序完成，旧写入后完成会把新值覆盖掉；按键串行化
+    // 持久化可确保最终落盘值与内存中的最新快照一致，不影响不同配置键并行保存。
+    const asyncOp = entry.pendingWrite ? entry.pendingWrite.then(persist, persist) : persist();
+    entry.pendingWrite = asyncOp;
+    asyncOp.then(() => {
+      if (entry.pendingWrite === asyncOp) entry.pendingWrite = undefined;
+      // 后续写入已更新了内存快照时，不再广播这个中间值，避免旧通知把最新输入覆盖。
+      if (entry.version !== writeVersion) return;
+      // 发送消息通知更新
+      this.mq.publish<TKeyValue<T>>(SystemConfigChange, {
+        key,
+        value,
+        prev,
+      });
     });
-  }
-
-  public getChangetime() {
-    return this._get<number>("changetime", 0);
-  }
-
-  public setChangetime(n: number) {
-    this._set("changetime", n);
   }
 
   defaultCheckScriptUpdateCycle() {
@@ -218,6 +414,14 @@ export class SystemConfig {
     this._set("vscode_reconnect", val);
   }
 
+  public getKeepExtBackgroundAlive() {
+    return this._get<boolean>("keep_ext_background_alive", false);
+  }
+
+  public setKeepExtBackgroundAlive(val: boolean) {
+    this._set("keep_ext_background_alive", val);
+  }
+
   defaultBackup(): Parameters<typeof this.setBackup>[0] {
     return {
       filesystem: "webdav" as FileSystemType,
@@ -236,7 +440,7 @@ export class SystemConfig {
   defaultCloudSync(): CloudSyncConfig {
     return {
       enable: false,
-      syncDelete: true,
+      syncDelete: false,
       syncStatus: true,
       filesystem: "webdav",
       params: {},
@@ -263,7 +467,7 @@ export class SystemConfig {
     return this._get<CATFileStorage>("cat_file_storage", this.defaultCatFileStorage());
   }
 
-  setCatFileStorage(data: CATFileStorage | undefined) {
+  setCatFileStorage(data: CATFileStorage) {
     this._set("cat_file_storage", data);
   }
 
@@ -281,7 +485,7 @@ export class SystemConfig {
 
   setEslintConfig(v: string) {
     if (v === "") {
-      this._set("eslint_config", undefined);
+      this._set("eslint_config", defaultConfig);
       return;
     }
     JSON.parse(v);
@@ -294,11 +498,23 @@ export class SystemConfig {
 
   setEditorConfig(v: string) {
     if (v === "") {
-      this._set("editor_config", undefined);
+      this._set("editor_config", editorDefaultConfig);
       return;
     }
     JSON.parse(v);
     return this._set("editor_config", v);
+  }
+
+  defaultEditorPreferences(): EditorPreferences {
+    return { ...DEFAULT_EDITOR_PREFERENCES };
+  }
+
+  getEditorPreferences() {
+    return this._get<EditorPreferences>("editor_preferences", this.defaultEditorPreferences());
+  }
+
+  setEditorPreferences(v: EditorPreferences | undefined) {
+    this._set("editor_preferences", v);
   }
 
   // 获取typescript类型定义
@@ -324,26 +540,52 @@ export class SystemConfig {
     this._set("log_clean_cycle", val);
   }
 
-  // 设置脚本列表列宽度
-  getScriptListColumnWidth() {
-    return this._get<{ [key: string]: number }>("script_list_column_width", {});
+  /** 回收站是否启用。关闭后删除脚本将直接彻底删除 */
+  getTrashEnabled() {
+    return this._get<boolean>("trash_enabled", true);
   }
 
-  setScriptListColumnWidth(val: { [key: string]: number }) {
-    this._set("script_list_column_width", val);
+  setTrashEnabled(val: boolean) {
+    this._set("trash_enabled", val);
+  }
+
+  /** 回收站保留天数。0 表示永不自动清理 */
+  getTrashRetentionDays() {
+    return this._get<number>("trash_retention_days", 30);
+  }
+
+  setTrashRetentionDays(val: number) {
+    this._set("trash_retention_days", val);
   }
 
   defaultMenuExpandNum() {
     return 5;
   }
 
-  // 展开菜单数
+  // 单个脚本行内展开的菜单项数量，0 表示展开脚本行后才显示菜单
   getMenuExpandNum() {
     return this._get<number>("menu_expand_num", this.defaultMenuExpandNum());
   }
 
   setMenuExpandNum(val: number) {
     this._set("menu_expand_num", val);
+  }
+
+  /** popup 每个分组展开显示的脚本数量，0 表示不折叠 */
+  getScriptListExpandNum() {
+    return this._get<number>("script_list_expand_num", 5);
+  }
+
+  setScriptListExpandNum(val: number) {
+    this._set("script_list_expand_num", val);
+  }
+
+  getPopupCompactLayout() {
+    return this._get<boolean>("popup_compact_layout", false);
+  }
+
+  setPopupCompactLayout(val: boolean) {
+    this._set("popup_compact_layout", val);
   }
 
   async getLanguage() {
@@ -384,12 +626,14 @@ export class SystemConfig {
     });
   }
 
-  getCheckUpdate() {
-    return this._get<Parameters<typeof this.setCheckUpdate>[0]>("check_update", {
+  async getCheckUpdate(opts?: { sanitizeHTML?: (html: string) => string }) {
+    const result = await this._get<Parameters<typeof this.setCheckUpdate>[0]>("check_update", {
       notice: "",
       isRead: false,
       version: ExtVersion,
     });
+    if (typeof opts?.sanitizeHTML === "function") result.notice = opts.sanitizeHTML(result.notice);
+    return result;
   }
 
   setEnableScript(enable: boolean) {
@@ -422,6 +666,46 @@ export class SystemConfig {
     return this._get<boolean>("enable_script_incognito", true);
   }
 
+  setExternalAccessEnabled(enable: boolean) {
+    this._set("external_access_enabled", enable);
+  }
+
+  getExternalAccessEnabled() {
+    return this._get<boolean>("external_access_enabled", false);
+  }
+
+  setExternalAccessUrl(url: string) {
+    this._set("external_access_url", url);
+  }
+
+  getExternalAccessUrl() {
+    return this._get<string>("external_access_url", "ws://localhost:8643");
+  }
+
+  setExternalAccessWritePolicy(policy: ExternalAccessWritePolicy) {
+    this._set("external_access_write_policy", policy);
+  }
+
+  getExternalAccessWritePolicy() {
+    return this._get<ExternalAccessWritePolicy>("external_access_write_policy", "approval");
+  }
+
+  setExternalAccessSourceReadPolicy(policy: ExternalAccessSourceReadPolicy) {
+    this._set("external_access_source_read_policy", policy);
+  }
+
+  getExternalAccessSourceReadPolicy() {
+    return this._get<ExternalAccessSourceReadPolicy>("external_access_source_read_policy", "approval");
+  }
+
+  setExternalAccessPairing(pairing: ExternalAccessPairing | undefined) {
+    this._set("external_access_pairing", pairing);
+  }
+
+  getExternalAccessPairing() {
+    return this._get<ExternalAccessPairing>("external_access_pairing", { key: "", clientId: "" });
+  }
+
   setBlacklist(blacklist: string) {
     this._set("blacklist", blacklist);
   }
@@ -436,7 +720,7 @@ export class SystemConfig {
   }
 
   getBadgeNumberType() {
-    return this._get<"none" | "run_count" | "script_count">("badge_number_type", "run_count");
+    return this._get<"none" | "run_count" | "script_count">("badge_number_type", "script_count");
   }
 
   setBadgeBackgroundColor(color: string) {
@@ -462,6 +746,14 @@ export class SystemConfig {
 
   getScriptMenuDisplayType(): Promise<"no_browser" | "all"> {
     return this._get("script_menu_display_type", "all");
+  }
+
+  getFaviconService() {
+    return this._get<FaviconService>("favicon_service", "scriptcat");
+  }
+
+  setFaviconService(val: FaviconService) {
+    return this._set("favicon_service", val);
   }
 }
 

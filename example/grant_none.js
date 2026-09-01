@@ -9,4 +9,3 @@
 // ==/UserScript==
 
 console.log("Grant None", this, GM_info);
-

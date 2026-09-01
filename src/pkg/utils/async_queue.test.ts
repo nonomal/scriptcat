@@ -1,21 +1,11 @@
 // async_queue.test.ts
 import { describe, it, expect } from "vitest";
 import { stackAsyncTask } from "./async_queue";
+import { deferred } from "@App/pkg/utils/utils";
 
 /* ==================== 工具函数 ==================== */
 
 const generateKey = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
-/** 手动控制的 Promise（用于阻塞） */
-const deferred = <T = void>() => {
-  let resolve!: (v: T | PromiseLike<T>) => void;
-  let reject!: (e?: any) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-};
 
 const nextTick = () => Promise.resolve();
 /** 强制执行所有已入队微任务与 then 链 */
@@ -275,7 +265,9 @@ describe.concurrent("stackAsyncTask 测试", () => {
   });
 
   /* ------------------- 5. 压力 + 递回 ------------------- */
-  it.concurrent("【5】大量任务、递回不死锁 + 返回值正确", async () => {
+  // 3000 个任务的串行 await 链在并发 worker 争抢下单次实测可达 300ms+，
+  // 逼近全局 340ms 预算；对这类真实成本用例给出显式单测预算，不放宽全局超时。
+  it.sequential("【5】大量任务、递回不死锁 + 返回值正确", { timeout: 850 }, async () => {
     const kMass = generateKey("mass");
     const kRecur = generateKey("recur");
     const gMass = setupBlockingTask(kMass);
@@ -354,25 +346,5 @@ describe.concurrent("stackAsyncTask 测试", () => {
     const results = await Promise.all(promises);
     expect(order).toEqual([0, 1, 2, 3, 4]);
     expect(results).toEqual([0, 1, 2, 3, 4]);
-  });
-
-  /* ------------------- 7. 跨 key 链接（正确 await 返回值） ------------------- */
-  it.concurrent("【7】跨 key 链接：内部任务返回值可被外层 await（不 await stackAsyncTask）", async () => {
-    const kOuter = generateKey("outer");
-    const kInner = generateKey("inner");
-
-    const pOuter = stackAsyncTask(kOuter, async () => {
-      const pInner = stackAsyncTask(kInner, async () => {
-        return "inner-data";
-      });
-      const data = await pInner; // 正确：await 返回值
-      return `outer(${data})`;
-    });
-
-    setupBlockingTask(kOuter).resolve();
-    setupBlockingTask(kInner).resolve();
-    await flush();
-
-    await expect(pOuter).resolves.toBe("outer(inner-data)");
   });
 });

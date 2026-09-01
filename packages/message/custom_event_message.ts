@@ -1,9 +1,36 @@
 import type { Message, MessageConnect, RuntimeMessageSender, TMessage } from "./types";
-import { v4 as uuidv4 } from "uuid";
+import { uuidv4 } from "@App/pkg/utils/uuid";
 import { type PostMessage, type WindowMessageBody, WindowMessageConnect } from "./window_message";
-import LoggerCore from "@App/app/logger/core";
 import EventEmitter from "eventemitter3";
 import { DefinedFlags } from "@App/app/service/service_worker/runtime.consts";
+import {
+  pageDispatchEvent,
+  pageAddEventListener,
+  pageDispatchCustomEvent,
+  MouseEventClone,
+  CustomEventClone,
+  createMouseEvent,
+} from "@Packages/message/common";
+import { ReadyWrap } from "@App/pkg/utils/ready-wrap";
+import type { ScriptEnvTag } from "@Packages/message/consts";
+
+// 避免页面载入后改动 Map.prototype 导致消息传递失败
+const relatedTargetMapMethods = {
+  set: Map.prototype.set,
+  get: Map.prototype.get,
+  delete: Map.prototype.delete,
+};
+
+function createRelatedTargetMap() {
+  const map = new Map<number, EventTarget>();
+  map.set = relatedTargetMapMethods.set;
+  map.get = relatedTargetMapMethods.get;
+  map.delete = relatedTargetMapMethods.delete;
+  return map;
+}
+
+let relateId = 0;
+const maxInteger = Number.MAX_SAFE_INTEGER;
 
 export class CustomEventPostMessage implements PostMessage {
   constructor(private send: CustomEventMessage) {}
@@ -20,21 +47,34 @@ export class CustomEventMessage implements Message {
   readonly sendFlag: string;
 
   // 关联dom目标
-  relatedTarget: Map<number, EventTarget> = new Map();
+  relatedTarget: Map<number, EventTarget> = createRelatedTargetMap();
+  readyWrap: ReadyWrap = new ReadyWrap();
 
   constructor(
-    messageFlag: string,
-    protected readonly isContent: boolean
+    eventFlag: string,
+    protected readonly isInbound: boolean,
+    public readonly envTag: ScriptEnvTag | "" = ""
   ) {
-    this.receiveFlag = `evt${messageFlag}${isContent ? DefinedFlags.contentFlag : DefinedFlags.injectFlag}${DefinedFlags.domEvent}`;
-    this.sendFlag = `evt${messageFlag}${isContent ? DefinedFlags.injectFlag : DefinedFlags.contentFlag}${DefinedFlags.domEvent}`;
-    window.addEventListener(this.receiveFlag, (event) => {
-      if (event instanceof MouseEvent && event.movementX && event.relatedTarget) {
-        this.relatedTarget.set(event.movementX, event.relatedTarget!);
-      } else if (event instanceof CustomEvent) {
+    const messageFlag = `${eventFlag}${envTag}`;
+    this.receiveFlag = `${messageFlag}${isInbound ? DefinedFlags.inboundFlag : DefinedFlags.outboundFlag}${DefinedFlags.domEvent}`;
+    this.sendFlag = `${messageFlag}${isInbound ? DefinedFlags.outboundFlag : DefinedFlags.inboundFlag}${DefinedFlags.domEvent}`;
+    pageAddEventListener(this.receiveFlag, (event: Event) => {
+      if (event instanceof MouseEventClone && event.movementX === 0 && event.cancelable) {
+        event.preventDefault(); // 告知另一端这边已准备好
+        this.readyWrap.setReady(); // 两端已准备好，则 setReady()
+      } else if (event instanceof MouseEventClone && event.movementX && event.relatedTarget) {
+        if (event.cancelable) event.preventDefault(); // 告知另一端
+        this.relatedTarget.set(event.movementX, event.relatedTarget);
+      } else if (event instanceof CustomEventClone) {
         this.messageHandle(event.detail, new CustomEventPostMessage(this));
       }
     });
+    const ev = createMouseEvent(this.sendFlag, {
+      movementX: 0,
+      cancelable: true,
+    });
+    // 如另一端已准备好，则 setReady()
+    if (pageDispatchEvent(ev) === false) this.readyWrap.setReady();
   }
 
   messageHandle(data: WindowMessageBody, target: PostMessage) {
@@ -78,49 +118,41 @@ export class CustomEventMessage implements Message {
 
   connect(data: TMessage): Promise<MessageConnect> {
     return new Promise((resolve) => {
-      const body: WindowMessageBody<TMessage> = {
-        messageId: uuidv4(),
-        type: "connect",
-        data,
-      };
-      this.nativeSend(body);
-      // EventEmitter3 采用同步事件设计，callback会被马上执行而不像传统javascript架构以下一个macrotask 执行
-      resolve(new WindowMessageConnect(body.messageId, this.EE, new CustomEventPostMessage(this)));
+      this.readyWrap.onReady(() => {
+        const body: WindowMessageBody<TMessage> = {
+          messageId: uuidv4(),
+          type: "connect",
+          data,
+        };
+        this.nativeSend(body);
+        // EventEmitter3 采用同步事件设计，callback会被马上执行而不像传统javascript架构以下一个macrotask 执行
+        resolve(new WindowMessageConnect(body.messageId, this.EE, new CustomEventPostMessage(this)));
+      });
     });
   }
 
   nativeSend(detail: any) {
-    if (typeof cloneInto !== "undefined") {
-      try {
-        LoggerCore.logger().info("nativeSend");
-        detail = cloneInto(detail, document.defaultView);
-      } catch (e) {
-        console.log(e);
-        LoggerCore.logger().info("error data");
-      }
-    }
-
-    const ev = new CustomEvent(this.sendFlag, {
-      detail,
-    });
-    window.dispatchEvent(ev);
+    if (!this.readyWrap.isReady) throw new Error("custom_event_message is not ready.");
+    pageDispatchCustomEvent(this.sendFlag, detail);
   }
 
   sendMessage<T = any>(data: TMessage): Promise<T> {
     return new Promise((resolve: ((value: T) => void) | null) => {
-      const messageId = uuidv4();
-      const body: WindowMessageBody<TMessage> = {
-        messageId,
-        type: "sendMessage",
-        data,
-      };
-      const eventId = `response:${messageId}`;
-      this.EE.addListener(eventId, (body: WindowMessageBody<TMessage>) => {
-        this.EE.removeAllListeners(eventId);
-        resolve!(body.data as T);
-        resolve = null; // 设为 null 提醒JS引擎可以GC
+      this.readyWrap.onReady(() => {
+        const messageId = uuidv4();
+        const body: WindowMessageBody<TMessage> = {
+          messageId,
+          type: "sendMessage",
+          data,
+        };
+        const eventId = `response:${messageId}`;
+        this.EE.addListener(eventId, (body: WindowMessageBody<TMessage>) => {
+          this.EE.removeAllListeners(eventId);
+          resolve!(body.data as T);
+          resolve = null; // 设为 null 提醒JS引擎可以GC
+        });
+        this.nativeSend(body);
       });
-      this.nativeSend(body);
     });
   }
 
@@ -128,6 +160,7 @@ export class CustomEventMessage implements Message {
   // 与content页的消息通讯实际是同步,此方法不需要经过background
   // 但是请注意中间不要有promise
   syncSendMessage(data: TMessage): TMessage {
+    if (!this.readyWrap.isReady) throw new Error("custom_event_message is not ready.");
     const messageId = uuidv4();
     const body: WindowMessageBody<TMessage> = {
       messageId,
@@ -146,18 +179,17 @@ export class CustomEventMessage implements Message {
     return ret;
   }
 
-  relateId = 0;
-
   sendRelatedTarget(target: EventTarget): number {
+    if (!this.readyWrap.isReady) throw new Error("custom_event_message is not ready.");
     // 特殊处理relatedTarget，返回id进行关联
     // 先将relatedTarget转换成id发送过去
-    const id = ++this.relateId;
+    const id = (relateId = relateId === maxInteger ? 1 : relateId + 1);
     // 可以使用此种方式交互element
-    const ev = new MouseEvent(this.sendFlag, {
+    const ev = createMouseEvent(this.sendFlag, {
       movementX: id,
       relatedTarget: target,
     });
-    window.dispatchEvent(ev);
+    pageDispatchEvent(ev);
     return id;
   }
 

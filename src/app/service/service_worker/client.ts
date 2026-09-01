@@ -1,29 +1,152 @@
 import type { Script, ScriptCode, ScriptRunResource, TClientPageLoadInfo } from "@App/app/repo/scripts";
 import { type Resource } from "@App/app/repo/resource";
 import { type Subscribe } from "@App/app/repo/subscribe";
+import { type Logger } from "@App/app/repo/logger";
 import { type Permission } from "@App/app/repo/permission";
-import type { InstallSource, ScriptMenu, ScriptMenuItem, SearchType, TBatchUpdateListAction } from "./types";
+import type { InstallSource, ScriptMenu, ScriptMenuItem, TBatchUpdateListAction, TPopupPageStatus } from "./types";
 import { Client } from "@Packages/message/client";
 import type { MessageSend } from "@Packages/message/types";
 import type PermissionVerify from "./permission_verify";
 import { type UserConfirm } from "./permission_verify";
 import { type FileSystemType } from "@Packages/filesystem/factory";
-import { v4 as uuidv4 } from "uuid";
-import { cacheInstance } from "@App/app/cache";
-import { CACHE_KEY_IMPORT_FILE } from "@App/app/cache_key";
 import { type ResourceBackup } from "@App/pkg/backup/struct";
-import { type VSCodeConnect } from "../offscreen/vscode-connect";
-import { type SystemService } from "./system";
+import { type ConfigBundle } from "@App/pkg/backup/config_bundle";
+import { type VSCodeConnectParam } from "../offscreen/vscode-connect";
 import { type ScriptInfo } from "@App/pkg/utils/scriptInstall";
-import type { ScriptService, TCheckScriptUpdateOption, TOpenBatchUpdatePageOption } from "./script";
+import type {
+  AgentModelConfig,
+  AgentTaskApiRequest,
+  MCPApiRequest,
+  SkillConfigField,
+} from "@App/app/service/agent/core/types";
+import type { SearchEngineConfig } from "@App/app/service/agent/core/tools/search_config";
+import type {
+  ScriptService,
+  TCheckScriptUpdateOption,
+  TOpenBatchUpdatePageOption,
+  TRestoreResult,
+  TScriptInstallParam,
+  TScriptInstallReturn,
+} from "./script";
+import type { TrashScript } from "@App/app/repo/trash_script";
+import { encodeRValue, type TKeyValuePair } from "@App/pkg/utils/message_value";
+import { type TSetValuesParams } from "./value";
+import type { LocalBackupExport } from "./synchronize";
+import type { ExternalAccessUIService } from "./external_access/service";
+import type { WSEnvelope } from "./external_access/types";
+import type {
+  NetworkRuleMutationResult,
+  NetworkRuleCreateInput,
+  NetworkRuleDeleteInput,
+  NetworkRuleEnabledInput,
+  NetworkRuleMasterEnabledInput,
+  NetworkRuleReorderInput,
+  NetworkRuleServiceError,
+  NetworkRuleSnapshot,
+  NetworkRuleUpdateInput,
+} from "./network_rule";
+
+export type { NetworkRuleServiceError } from "./network_rule";
 
 export class ServiceWorkerClient extends Client {
   constructor(msgSender: MessageSend) {
     super(msgSender, "serviceWorker");
   }
 
-  preparationOffscreen() {
-    return this.do("preparationOffscreen");
+  preparationOffscreen(data: { verified: boolean }) {
+    return this.do("preparationOffscreen", data);
+  }
+}
+
+export function parseNetworkRuleError(error: unknown): NetworkRuleServiceError {
+  const payload =
+    typeof error === "string"
+      ? (() => {
+          try {
+            return JSON.parse(error) as unknown;
+          } catch {
+            return undefined;
+          }
+        })()
+      : error;
+  if (payload && typeof payload === "object" && "code" in payload) {
+    const code = payload.code;
+    if (
+      code === "invalid_input" ||
+      code === "not_found" ||
+      code === "revision_conflict" ||
+      code === "storage_read_failed" ||
+      code === "storage_write_failed" ||
+      code === "unsupported_schema"
+    ) {
+      return payload as NetworkRuleServiceError;
+    }
+  }
+  return { code: "storage_write_failed" };
+}
+
+/**
+ * chrome.runtime.sendMessage 的响应通道在 service worker 处理耗时较长时可能被浏览器丢弃
+ * （例如用户填写表单期间 service worker 进入空闲状态）。此时请求本身可能已在后台成功执行，
+ * 只是响应没能送达，与服务端明确返回的失败无法用同一错误区分，因此单独抛出，交由调用方
+ * 通过重新拉取 state 来判断该次操作究竟是否已生效。
+ */
+export class NetworkRuleAmbiguousResponseError extends Error {
+  constructor() {
+    super("network rule response lost in transit");
+    this.name = "NetworkRuleAmbiguousResponseError";
+  }
+}
+
+export class NetworkRuleClient extends Client {
+  constructor(msgSender: MessageSend) {
+    super(msgSender, "serviceWorker/networkRule");
+  }
+
+  private async request<T>(action: string, data?: unknown): Promise<T> {
+    let result: T | undefined;
+    try {
+      result = await this.do<T>(action, data);
+    } catch (error) {
+      throw parseNetworkRuleError(error);
+    }
+    if (result === undefined) {
+      if (action === "getState") throw parseNetworkRuleError(undefined);
+      throw new NetworkRuleAmbiguousResponseError();
+    }
+    return result;
+  }
+
+  getState(): Promise<NetworkRuleSnapshot> {
+    return this.request<NetworkRuleSnapshot>("getState");
+  }
+
+  createRule(input: NetworkRuleCreateInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("createRule", input);
+  }
+
+  updateRule(input: NetworkRuleUpdateInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("updateRule", input);
+  }
+
+  deleteRules(input: NetworkRuleDeleteInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("deleteRules", input);
+  }
+
+  setRulesEnabled(input: NetworkRuleEnabledInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("setRulesEnabled", input);
+  }
+
+  setMasterEnabled(input: NetworkRuleMasterEnabledInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("setMasterEnabled", input);
+  }
+
+  reorderRules(input: NetworkRuleReorderInput): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("reorderRules", input);
+  }
+
+  retryApply(): Promise<NetworkRuleMutationResult> {
+    return this.request<NetworkRuleMutationResult>("retryApply");
   }
 }
 
@@ -39,19 +162,28 @@ export class ScriptClient extends Client {
 
   // 获取安装信息
   getInstallInfo(uuid: string) {
-    return this.do<[boolean, ScriptInfo]>("getInstallInfo", uuid);
+    return this.do<[boolean, ScriptInfo, { byWebRequest?: boolean }]>("getInstallInfo", uuid);
   }
 
-  install(script: Script, code: string, upsertBy: InstallSource = "user"): Promise<{ update: boolean }> {
-    return this.doThrow("install", { script, code, upsertBy });
+  install(params: TScriptInstallParam): Promise<TScriptInstallReturn> {
+    if (!params.upsertBy) params.upsertBy = "user";
+    return this.doThrow("install", { ...params } satisfies TScriptInstallParam);
   }
-
-  // delete(uuid: string) {
-  //   return this.do("delete", uuid);
-  // }
 
   deletes(uuids: string[]) {
     return this.do("deletes", uuids);
+  }
+
+  restores(uuids: string[]) {
+    return this.do<TRestoreResult>("restores", uuids);
+  }
+
+  purges(uuids: string[]) {
+    return this.do<boolean>("purges", uuids);
+  }
+
+  getTrashScripts() {
+    return this.do<TrashScript[]>("getTrashScripts");
   }
 
   enable(uuid: string, enable: boolean) {
@@ -62,11 +194,11 @@ export class ScriptClient extends Client {
     return this.do("enables", { uuids, enable });
   }
 
-  info(uuid: string): Promise<Script> {
-    return this.doThrow("fetchInfo", uuid);
+  findInfo(uuid: string): Promise<Script | null | undefined> {
+    return this.do<Script | null>("fetchInfo", uuid);
   }
 
-  getFilterResult(req: { type: SearchType; value: string }): Promise<ScriptCode | undefined> {
+  getFilterResult(req: { value: string }): Promise<ScriptCode | undefined> {
     return this.do("getFilterResult", req);
   }
 
@@ -74,8 +206,16 @@ export class ScriptClient extends Client {
     return this.doThrow("getScriptRunResourceByUUID", uuid);
   }
 
-  excludeUrl(uuid: string, excludePattern: string, remove: boolean) {
-    return this.do("excludeUrl", { uuid, excludePattern, remove });
+  onlyRunOnUrl(uuid: string, matchPattern: string) {
+    return this.do("onlyRunOnUrl", { uuid, matchPattern });
+  }
+
+  allowUrl(uuid: string, matchPattern: string, excludePattern: string) {
+    return this.do("allowUrl", { uuid, matchPattern, excludePattern });
+  }
+
+  excludeFromMatch(uuid: string, host: string, url: string) {
+    return this.do("excludeFromMatch", { uuid, host, url });
   }
 
   // 重置匹配项
@@ -92,8 +232,8 @@ export class ScriptClient extends Client {
     return this.do("requestCheckUpdate", uuid);
   }
 
-  sortScript(active: string, over: string) {
-    return this.do("sortScript", { active, over });
+  sortScript(data: { before: string[]; after: string[] }) {
+    return this.do("sortScript", data);
   }
 
   pinToTop(uuids: string[]) {
@@ -108,70 +248,12 @@ export class ScriptClient extends Client {
     return this.do("installByCode", { uuid, code, upsertBy });
   }
 
-  async formatUrl(url: string) {
-    try {
-      const newUrl = new URL(url.replace(/\/$/, ""));
-      const { hostname, pathname } = newUrl;
-      // 判断是否为脚本猫脚本页
-      if (hostname === "scriptcat.org" && /script-show-page\/\d+$/.test(pathname)) {
-        const scriptId = pathname.match(/\d+$/)![0];
-        // 请求脚本信息
-        const scriptInfo = await fetch(`https://scriptcat.org/api/v2/scripts/${scriptId}`)
-          .then((res) => {
-            return res.json();
-          })
-          .then((json) => {
-            return json;
-          });
-        const { code, data, msg } = scriptInfo;
-        if (code !== 0) {
-          // 无脚本访问权限
-          return { success: false, msg };
-        } else {
-          // 返回脚本实际安装地址
-          const scriptName = data.name;
-          return `https://scriptcat.org/scripts/code/${scriptId}/${scriptName}.user.js`;
-        }
-      } else {
-        return url;
-      }
-    } catch {
-      return url;
-    }
-  }
-
-  async importByUrls(urls: string[]) {
-    if (urls.length == 0) {
-      return;
-    }
-    const results = (await Promise.allSettled(
-      urls.map(async (url) => {
-        const formattedResult = await this.formatUrl(url);
-        if (formattedResult instanceof Object) {
-          return await Promise.resolve(formattedResult);
-        } else {
-          return await this.do("importByUrl", formattedResult);
-        }
-      })
-      // this.do 只会resolve 不会reject
-    )) as PromiseFulfilledResult<{ success: boolean; msg: string }>[];
-    const stat = { success: 0, fail: 0, msg: [] as string[] };
-    results.forEach(({ value }, index) => {
-      if (value.success) {
-        stat.success++;
-      } else {
-        stat.fail++;
-        stat.msg.push(`#${index + 1}: ${value.msg}`);
-      }
-    });
-    return stat;
-  }
-
   setCheckUpdateUrl(uuid: string, checkUpdate: boolean, checkUpdateUrl?: string) {
     return this.do("setCheckUpdateUrl", { uuid, checkUpdate, checkUpdateUrl });
   }
 
-  updateMetadata(uuid: string, key: string, value: string[]) {
+  // value 为 undefined 表示撤销用户覆盖，生效值回落脚本自带 metadata
+  updateMetadata(uuid: string, key: string, value: string[] | undefined) {
     return this.do("updateMetadata", { uuid, key, value });
   }
   async getBatchUpdateRecordLite(i: number) {
@@ -226,12 +308,13 @@ export class ValueClient extends Client {
     return this.doThrow("getScriptValue", script);
   }
 
-  setScriptValue(uuid: string, key: string, value: any) {
-    return this.do("setScriptValue", { uuid, key, value });
+  setScriptValue({ uuid, key, value, ts }: { uuid: string; key: string; value: any; ts?: number }) {
+    const keyValuePairs = [[key, encodeRValue(value)]] as TKeyValuePair[];
+    return this.do("setScriptValues", { uuid, keyValuePairs, ts } as TSetValuesParams);
   }
 
-  setScriptValues(uuid: string, values: { [key: string]: any }) {
-    return this.do("setScriptValues", { uuid, values });
+  setScriptValues(params: TSetValuesParams) {
+    return this.do("setScriptValues", params);
   }
 }
 
@@ -252,6 +335,11 @@ export class RuntimeClient extends Client {
     return this.doThrow("pageLoad");
   }
 
+  /** bfcache 还原上报：只告知本页仍在运行，不请求脚本 */
+  pageShow() {
+    return this.do("pageShow");
+  }
+
   scriptLoad(flag: string, uuid: string) {
     return this.do("scriptLoad", { flag, uuid });
   }
@@ -263,8 +351,8 @@ export type GetPopupDataReq = {
 };
 
 export type GetPopupDataRes = {
-  // 在黑名单
-  isBlacklist: boolean;
+  // 当前页状态：非 ok 时 scriptList 为空，由 Popup 说明原因
+  pageStatus: TPopupPageStatus;
   scriptList: ScriptMenu[];
   backScriptList: ScriptMenu[];
 };
@@ -332,28 +420,12 @@ export class SynchronizeClient extends Client {
     super(msgSender, "serviceWorker/synchronize");
   }
 
-  export(uuids?: string[]) {
-    return this.do("export", uuids);
+  export(uuids?: string[]): Promise<LocalBackupExport> {
+    return this.doThrow("export", uuids);
   }
 
   backupToCloud(type: FileSystemType, params: any) {
     return this.do("backupToCloud", { type, params });
-  }
-
-  async openImportWindow(filename: string, file: File | Blob) {
-    // 打开导入窗口，用cache实现数据交互
-    const url = URL.createObjectURL(file);
-    // setTimeout(() => {
-    //   URL.revokeObjectURL(url);
-    // }, 60 * 1000);
-    const uuid = uuidv4();
-    const cacheKey = `${CACHE_KEY_IMPORT_FILE}${uuid}`;
-    await cacheInstance.set(cacheKey, {
-      filename: filename,
-      url: url,
-    });
-    // 打开导入窗口，用cache实现数据交互
-    window.open(chrome.runtime.getURL(`/src/import.html?uuid=${uuid}`), "_blank");
   }
 
   importResources(
@@ -361,14 +433,28 @@ export class SynchronizeClient extends Client {
     requires: ResourceBackup[],
     resources: ResourceBackup[],
     requiresCss: ResourceBackup[]
-  ) {
+  ): Promise<string[] | undefined> {
     return this.do("importResources", { uuid, requires, resources, requiresCss });
+  }
+
+  restoreConfigBundle(bundle: ConfigBundle): Promise<void> {
+    return this.do("restoreConfigBundle", bundle);
+  }
+
+  // 手动触发一次云同步（设置页「立即同步」）
+  cloudSyncOnce(): Promise<void> {
+    return this.do("cloudSyncOnce");
   }
 }
 
 export class SubscribeClient extends Client {
   constructor(msgSender: MessageSend) {
     super(msgSender, "serviceWorker/subscribe");
+  }
+
+  // 订阅数量通常不多，但与 getAllScripts 一致，直接从 serviceWorker 内存读取
+  getAllSubscribe(): Promise<Subscribe[]> {
+    return this.doThrow("getAllSubscribe");
   }
 
   install(subscribe: Subscribe) {
@@ -388,20 +474,229 @@ export class SubscribeClient extends Client {
   }
 }
 
+export class LogClient extends Client {
+  constructor(msgSender: MessageSend) {
+    super(msgSender, "serviceWorker/log");
+  }
+
+  getLogs(start: number, end: number): Promise<Logger[]> {
+    return this.doThrow("getLogs", { start, end });
+  }
+
+  deleteLogs(ids: number[]): Promise<void> {
+    return this.do("deleteLogs", ids);
+  }
+
+  clearLogs(): Promise<void> {
+    return this.do("clearLogs");
+  }
+}
+
 export class SystemClient extends Client {
   constructor(msgSender: MessageSend) {
     super(msgSender, "serviceWorker/system");
   }
 
-  connectVSCode(params: Parameters<VSCodeConnect["connect"]>[0]): ReturnType<VSCodeConnect["connect"]> {
+  connectVSCode(params: VSCodeConnectParam): Promise<void> {
     return this.do("connectVSCode", params);
   }
+}
 
-  loadFavicon(icon: string): Promise<string> {
-    return this.doThrow("loadFavicon", icon);
+export class AgentClient extends Client {
+  constructor(msgSender: MessageSend) {
+    super(msgSender, "serviceWorker/agent");
   }
 
-  getFaviconFromDomain(domain: string): ReturnType<SystemService["getFaviconFromDomain"]> {
-    return this.doThrow("getFaviconFromDomain", domain);
+  installSkill(params: {
+    skillMd: string;
+    scripts?: Array<{ name: string; code: string }>;
+    references?: Array<{ name: string; content: string }>;
+  }): Promise<unknown> {
+    return this.do("installSkill", params);
+  }
+
+  removeSkill(name: string): Promise<unknown> {
+    return this.do("removeSkill", name);
+  }
+
+  refreshSkill(name: string): Promise<boolean> {
+    return this.doThrow("refreshSkill", name);
+  }
+
+  setSkillEnabled(name: string, enabled: boolean): Promise<boolean> {
+    return this.doThrow("setSkillEnabled", { name, enabled });
+  }
+
+  prepareSkillInstall(zipBase64: string): Promise<string> {
+    return this.doThrow("prepareSkillInstall", zipBase64);
+  }
+
+  prepareSkillFromUrl(url: string): Promise<string> {
+    return this.doThrow("prepareSkillFromUrl", url);
+  }
+
+  getSkillInstallData(uuid: string): Promise<{
+    skillMd: string;
+    metadata: {
+      name: string;
+      description: string;
+      version?: string;
+      config?: Record<string, SkillConfigField>;
+    };
+    prompt: string;
+    scripts: Array<{ name: string; code: string }>;
+    references: Array<{ name: string; content: string }>;
+    isUpdate: boolean;
+    installUrl?: string;
+  }> {
+    return this.doThrow("getSkillInstallData", uuid);
+  }
+
+  completeSkillInstall(uuid: string): Promise<unknown> {
+    return this.doThrow("completeSkillInstall", uuid);
+  }
+
+  cancelSkillInstall(uuid: string): Promise<void> {
+    return this.do("cancelSkillInstall", uuid);
+  }
+
+  checkForUpdates(): Promise<
+    Array<{ name: string; currentVersion: string; remoteVersion: string; installUrl: string }>
+  > {
+    return this.doThrow("checkForUpdates");
+  }
+
+  updateSkill(name: string): Promise<unknown> {
+    return this.doThrow("updateSkill", name);
+  }
+
+  getSkillConfigValues(name: string): Promise<Record<string, unknown>> {
+    return this.doThrow("getSkillConfigValues", name);
+  }
+
+  saveSkillConfig(params: { name: string; values: Record<string, unknown> }): Promise<void> {
+    return this.doThrow("saveSkillConfig", params);
+  }
+
+  // Model CRUD
+  listModels(): Promise<AgentModelConfig[]> {
+    return this.doThrow("listModels");
+  }
+
+  getModel(id: string) {
+    return this.do<AgentModelConfig | undefined>("getModel", id);
+  }
+
+  saveModel(model: AgentModelConfig) {
+    return this.do("saveModel", model);
+  }
+
+  removeModel(id: string) {
+    return this.do("removeModel", id);
+  }
+
+  // 默认模型（未设置时返回空字符串，不能用 doThrow，否则全新安装无默认模型时会抛错）
+  getDefaultModelId(): Promise<string> {
+    return this.do("getDefaultModelId").then((id) => id || "");
+  }
+
+  setDefaultModelId(id: string) {
+    return this.do("setDefaultModelId", id);
+  }
+
+  // 摘要模型（未设置时返回空字符串，不能用 doThrow）
+  getSummaryModelId(): Promise<string> {
+    return this.do("getSummaryModelId").then((id) => id || "");
+  }
+
+  setSummaryModelId(id: string) {
+    return this.do("setSummaryModelId", id);
+  }
+
+  // 搜索配置
+  getSearchConfig(): Promise<SearchEngineConfig> {
+    return this.doThrow("getSearchConfig");
+  }
+
+  saveSearchConfig(config: SearchEngineConfig) {
+    return this.do("saveSearchConfig", config);
+  }
+
+  agentTask(request: AgentTaskApiRequest): Promise<unknown> {
+    return this.doThrow("agentTask", request);
+  }
+
+  // MCP API
+  mcpApi(request: MCPApiRequest): Promise<unknown> {
+    return this.doThrow("mcpApi", request);
+  }
+}
+
+// Page-facing client for the external-access bridge (ScriptCat as an MCP *server* exposed
+// to external AI clients) — unrelated to AgentClient.mcpApi above, which is the opposite
+// direction (ScriptCat's own agent acting as an MCP *client* of external servers).
+export class ExternalAccessClient extends Client {
+  constructor(msgSender: MessageSend) {
+    super(msgSender, "serviceWorker/externalAccess");
+  }
+
+  getBridgeStatus(): Promise<ReturnType<ExternalAccessUIService["getStatus"]>> {
+    return this.doThrow("status");
+  }
+
+  // Enrollment (接入): dial the daemon with the one-time code the user read from `sctl connect`.
+  enroll(code: string) {
+    return this.do("enroll", code);
+  }
+
+  getOperation(operationId: string): ReturnType<ExternalAccessUIService["getOperation"]> {
+    return this.doThrow("operation", operationId);
+  }
+
+  decideOperation(param: {
+    operationId: string;
+    approved: boolean;
+    enable?: boolean;
+    rememberSession?: boolean;
+  }): ReturnType<ExternalAccessUIService["decideOperation"]> {
+    return this.doThrow("operationDecision", param);
+  }
+
+  // Re-opens a still-pending op's confirm page (误关重开入口). The "待确认" reopen row calls this
+  // after the user closed the confirm tab without deciding.
+  reopenOperation(operationId: string): ReturnType<ExternalAccessUIService["reopenOperation"]> {
+    return this.doThrow("operationReopen", operationId);
+  }
+
+  // Still-pending ops for the "待确认" reopen list.
+  getPendingOperations(): ReturnType<ExternalAccessUIService["getPendingOperations"]> {
+    return this.doThrow("pendingOperations");
+  }
+
+  // "停止外部接入" kill switch: discard key K + drop 本会话允许 grants + stop + disable.
+  stopExternalAccess() {
+    return this.do("stopExternalAccess");
+  }
+}
+
+// offscreen → SW relay for the MCP WS transport. The offscreen ExternalAccessConnect owns the socket and the
+// auth handshake; once a connection is live it forwards decoded business envelopes (and the newly
+// paired long-term key) up to ExternalAccessController here. Deliberately fire-and-forget: a blocking write
+// approval may keep a bridge.request pending for minutes, so the relay never awaits the dispatch.
+export class ExternalAccessConnectRelayClient extends Client {
+  constructor(msgSender: MessageSend) {
+    super(msgSender, "serviceWorker/externalAccessConnect");
+  }
+
+  envelope(envelope: WSEnvelope): Promise<void> {
+    return this.do("envelope", envelope);
+  }
+
+  paired(key: string): Promise<void> {
+    return this.do("paired", { key });
+  }
+
+  disconnected(): Promise<void> {
+    return this.do("disconnected");
   }
 }

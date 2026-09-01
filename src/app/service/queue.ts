@@ -20,9 +20,11 @@ export type TInstallScriptParams = {
 
 export type TInstallScript = { script: TInstallScriptParams; update: boolean; upsertBy?: InstallSource };
 
-export type TDeleteScript = { uuid: string; storageName: string; type: SCRIPT_TYPE };
+export type TDeleteScript = { uuid: string; storageName: string; type: SCRIPT_TYPE; deleteBy?: InstallSource };
 
-export type TSortedScript = { uuid: string; sort: number };
+export const CLOUD_SYNC_QUEUE_KEY = "cloud_sync_queue";
+
+export type TSortedScript = { uuid: string; sort: number; sortUpdatetime?: number };
 
 export type TInstallSubscribe = { subscribe: Subscribe };
 

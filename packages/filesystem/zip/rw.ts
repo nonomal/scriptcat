@@ -1,6 +1,5 @@
-import type { JSZipObject } from "jszip";
-import type JSZip from "jszip";
-import type { FileReader, FileWriter } from "../filesystem";
+import type { JSZipFileOptions, JSZipFile, JSZipObject } from "@App/pkg/utils/jszip-x";
+import type { FileCreateOptions, FileReader, FileWriter } from "../filesystem";
 
 export class ZipFileReader implements FileReader {
   zipObject: JSZipObject;
@@ -15,16 +14,27 @@ export class ZipFileReader implements FileReader {
 }
 
 export class ZipFileWriter implements FileWriter {
-  zip: JSZip;
+  zip: JSZipFile;
 
   path: string;
 
-  constructor(zip: JSZip, path: string) {
+  modifiedDate: number | undefined;
+
+  constructor(zip: JSZipFile, path: string, opts?: FileCreateOptions) {
     this.zip = zip;
     this.path = path;
+    if (opts && opts.modifiedDate) {
+      this.modifiedDate = opts.modifiedDate;
+    }
   }
 
-  async write(content: string): Promise<void> {
-    this.zip.file(this.path, content);
+  async write(content: string | Blob): Promise<void> {
+    const opts = {} as JSZipFileOptions;
+    if (this.modifiedDate) {
+      opts.date = new Date(this.modifiedDate);
+      // jszipp does not require timezone adjustment to UTC Date
+    }
+    const fileData = typeof content === "string" ? content : new Uint8Array(await content.arrayBuffer());
+    this.zip.file(this.path, fileData, opts);
   }
 }

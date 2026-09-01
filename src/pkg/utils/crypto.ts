@@ -5,7 +5,7 @@ export function calculateMd5(blob: Blob) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.readAsArrayBuffer(blob);
-    reader.onloadend = () => {
+    reader.onloadend = function () {
       if (!reader.result) {
         reject(new Error("result is null"));
       } else {
@@ -18,6 +18,10 @@ export function calculateMd5(blob: Blob) {
 
 export function md5OfText(text: string) {
   return MD5(text).toString();
+}
+
+export function sha256OfText(text: string) {
+  return crypto.SHA256(text).toString();
 }
 
 function calculateMD5FromArrayBuffer(a: ArrayBuffer) {
